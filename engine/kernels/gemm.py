@@ -38,18 +38,12 @@ def block_m_for(rows: int) -> int:
 #: ones (gate/up at 19456, the LM head at 151936) want large tiles and deep
 #: pipelining. One list covers both; warmup picks per shape.
 CONFIGS = (
-    (16, 512, 4, 3),
-    (16, 256, 4, 4),
     (32, 256, 4, 3),
-    (32, 512, 8, 3),
     (64, 128, 4, 4),
     (64, 256, 8, 3),
-    (64, 512, 8, 2),
-    (128, 64, 4, 4),
     (128, 128, 8, 3),
-    (128, 256, 8, 2),
+    (128, 64, 4, 4),
     (256, 64, 8, 3),
-    (256, 128, 8, 2),
 )
 
 

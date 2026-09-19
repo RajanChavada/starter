@@ -255,8 +255,8 @@ so it is the verification step — no local or rented GPU required.
 | flash decode + fused projections + fallbacks | 5d2189a / f587d356 | 116.1 | 268.2 | 1514.3 | 479.4 | New banked best. TPOT ratios 0.22/0.24/0.24x native. Correctness and latency gates passed. |
 | skinny GEMM + chunked sync | c78533f / 8f04a7b3 | 125.2 | 273.2 | 1558.4 | 495.7 | New banked best. Candidate ms improved to 255.6/468.5/1314.2. |
 | fused RMSNorm + RoPE + SwiGLU | f4b49b6 / 3578a1ff | 188.5 | 383.9 | 2399.7 | 743.5 | New banked best. Candidate ms 169.7/333.4/853.4, TTFT 0.65/0.74/0.73x native. |
-| residual in GEMM epilogue + 12-config autotune | 7b48455 / b3f0f39a | | | | pending | |
-| one kernel for norm+rotary+cache write | 9fb9dbd / — | | | | pending | |
+| residual in GEMM epilogue + 12-config autotune | 7b48455 / b3f0f39a | 190.6 | 377.3 | 2246.8 | 719.1 | Lost to f4b49b6 despite public-0 gain. Candidate ms 167.9/339.3/911.5; engine reverted. |
+| one kernel for norm+rotary+cache write | 9fb9dbd / db4bf30d | 201.8 | 402.7 | 2464.6 | 780.8 | New banked best. Candidate ms 158.6/317.9/831.0. |
 
 ## What the measurements actually said
 
@@ -292,4 +292,3 @@ On this scoring that is roughly 1030. Going past it requires more than one
 token per weight read, i.e. speculative decoding with exact verification —
 which is also the one optimization whose cost depends on the prompt, and so
 sits in direct tension with the 25% spread gate we currently clear at 0.3%.
-| residual GEMM epilogue + wider GEMM search + sync-all | pending | pending | pending | pending | pending | Submitting next. Adds residual-add epilogue validation and raises sync chunk to 1024. |
