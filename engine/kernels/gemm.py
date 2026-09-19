@@ -64,34 +64,19 @@ SPLIT_CONFIGS = (
     (64, 64, 4, 3, 4),
 )
 
-#: QKV emits 6144 values.  At batch 1 a 64-wide tile creates only 96
-#: programs, short of H100's 132 SMs.  Two reduction slices turn it into 192
-#: independent weight streams without the large partial buffer cost of the
-#: narrow projections' deeper split-K plans.  The fused RMSNorm support in
-#: ``_split_gemm`` keeps this from reintroducing a norm launch.
-WIDE_SPLIT_CONFIGS = (
-    (64, 128, 4, 4, 2),
-    (64, 256, 4, 3, 2),
-    (32, 128, 4, 4, 2),
-)
-
 #: Above this output width there are already enough programs and the partial
 #: buffer would be large for no benefit.
 SPLIT_MAX_N = 4096
-WIDE_SPLIT_MAX_N = 8192
 
 
 @triton.jit
 def _split_gemm(
     x_ptr,
     w_ptr,
-    g_ptr,
     part_ptr,
     M,
     N,
     K,
-    eps,
-    NORMALIZE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -108,23 +93,6 @@ def _split_gemm(
     start = pid_k * per_split
     stop = tl.minimum(start + per_split, K)
 
-    inv = tl.zeros((BLOCK_M,), tl.float32)
-    if NORMALIZE:
-        # Every split needs the same scalar RMS denominator.  Its input
-        # traffic is tiny relative to this projection's 31 MB of weights, and
-        # the bf16 cast placement below matches Qwen3RMSNorm exactly.
-        squares = tl.zeros((BLOCK_M,), tl.float32)
-        for k0 in range(0, K, BLOCK_K):
-            offs_k = k0 + tl.arange(0, BLOCK_K)
-            k_live = offs_k < K
-            chunk = tl.load(
-                x_ptr + offs_m[:, None] * K + offs_k[None, :],
-                mask=m_live[:, None] & k_live[None, :],
-                other=0.0,
-            ).to(tl.float32)
-            squares += tl.sum(chunk * chunk, axis=1)
-        inv = tl.math.rsqrt(squares / K + eps)
-
     acc = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
     for k0 in range(start, stop, BLOCK_K):
         offs_k = k0 + tl.arange(0, BLOCK_K)
@@ -134,12 +102,6 @@ def _split_gemm(
             mask=m_live[:, None] & k_live[None, :],
             other=0.0,
         )
-        if NORMALIZE:
-            normed = (x.to(tl.float32) * inv[:, None]).to(tl.bfloat16)
-            gain = tl.load(g_ptr + offs_k, mask=k_live, other=0.0)
-            x = (normed.to(tl.float32) * gain[None, :].to(tl.float32)).to(
-                tl.bfloat16
-            )
         w = tl.load(
             w_ptr + offs_n[:, None] * K + offs_k[None, :],
             mask=n_live[:, None] & k_live[None, :],
@@ -279,8 +241,7 @@ def run(x, weight, out, config, residual=None, gain=None, eps=0.0) -> None:
             (split_k, rows, n), dtype=torch.float32, device=x.device
         )
         _split_gemm[(triton.cdiv(n, block_n), split_k)](
-            x, weight, gain if gain is not None else x, partials, rows, n, k, eps,
-            NORMALIZE=gain is not None,
+            x, weight, partials, rows, n, k,
             BLOCK_M=block_m_for(rows), BLOCK_N=block_n,
             BLOCK_K=block_k, SPLIT_K=split_k,
             num_warps=warps, num_stages=stages,
