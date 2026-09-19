@@ -251,4 +251,8 @@ so it is the verification step — no local or rented GPU required.
 
 | Stage | Submitted | public-0 | public-1 | public-2 | geomean | notes |
 | --- | --- | ---: | ---: | ---: | ---: | --- |
-| 0 baseline | pending | | | | | repo connection in progress |
+| static KV + direct layers + graph | d5334ff / 558ab255 | 104.1 | 229.0 | 1381.6 | 416.4 | Banked starting point from parent loop. TPOT ratios 0.44/0.52/0.45x native. |
+| flash decode + fused projections + fallbacks | 5d2189a / f587d356 | 116.1 | 268.2 | 1514.3 | 479.4 | New banked best. TPOT ratios 0.22/0.24/0.24x native. Correctness and latency gates passed. |
+| skinny GEMM + chunked sync | c78533f / 8f04a7b3 | 125.2 | 273.2 | 1558.4 | 495.7 | New banked best. Candidate ms improved to 255.6/468.5/1314.2. |
+| fused RMSNorm + RoPE + SwiGLU | f4b49b6 / 3578a1ff | 188.5 | 383.9 | 2399.7 | 743.5 | New banked best. Candidate ms 169.7/333.4/853.4, TTFT 0.65/0.74/0.73x native. |
+| residual GEMM epilogue + wider GEMM search + sync-all | pending | pending | pending | pending | pending | Submitting next. Adds residual-add epilogue validation and raises sync chunk to 1024. |

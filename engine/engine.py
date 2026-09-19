@@ -22,7 +22,7 @@ DEVICE = "cuda:0"
 
 #: Decode steps run between device syncs. Each yield must still be one step,
 #: but nothing requires one D2H copy per step, and the copy costs a stall.
-SYNC_CHUNK = 8
+SYNC_CHUNK = 1024
 
 #: Tolerance for accepting a custom GEMM against cuBLAS. Both accumulate in
 #: fp32 and round once, so a correct kernel lands far inside this.
@@ -162,7 +162,7 @@ class Engine:
             f"weights={torch.cuda.memory_allocated() / 2**30:.2f}GiB"
         )
 
-    def _mlp(self, layer, hidden, fast: bool = False):
+    def _mlp(self, layer, hidden, fast: bool = False, residual=None):
         linear = self._fast_linear if fast else _torch_linear
         gate_up = linear(layer.mlp.gateup_weight, hidden)
         if self._fused_swiglu:
@@ -171,7 +171,12 @@ class Engine:
             activated = (
                 F.silu(gate_up[..., : self.mlp_size]) * gate_up[..., self.mlp_size :]
             )
-        return linear(layer.mlp.down_proj.weight, activated)
+        if fast:
+            return self._fast_linear(
+                layer.mlp.down_proj.weight, activated, residual=residual
+            )
+        out = F.linear(activated, layer.mlp.down_proj.weight)
+        return out if residual is None else residual + out
 
     # ---------------------------------------------------------------- fusions
 
@@ -236,14 +241,25 @@ class Engine:
 
     # ------------------------------------------------------------ projections
 
-    def _fast_linear(self, weight, x):
-        """Decode-path matmul, using whichever of cuBLAS or Triton won at warmup."""
+    def _fast_linear(self, weight, x, residual=None):
+        """Decode-path matmul, using whichever of cuBLAS or Triton won at warmup.
+
+        ``residual`` is folded into the kernel's epilogue when the custom path
+        is active, removing one launch per residual branch per layer.
+        """
         config = self._gemm_plan.get(tuple(weight.shape))
         if config is None:
-            return F.linear(x, weight)
+            out = F.linear(x, weight)
+            return out if residual is None else residual + out
         rows = x.shape[0]
         out = torch.empty((rows, weight.shape[0]), dtype=x.dtype, device=x.device)
-        gemm.run(x.reshape(rows, -1), weight, out, config)
+        gemm.run(
+            x.reshape(rows, -1),
+            weight,
+            out,
+            config,
+            residual=None if residual is None else residual.reshape(rows, -1),
+        )
         return out.view(rows, 1, -1)
 
     def _plan_gemms(self, batch: int) -> None:
@@ -291,11 +307,28 @@ class Engine:
                 continue
             if elapsed < best_ms:
                 best, best_ms = config, elapsed
+
+        if best is not None and not self._residual_agrees(best, x, weight, out):
+            _log(f"gemm [{rows}x{columns}] residual epilogue wrong, keeping cublas")
+            best = None
         _log(
             f"gemm [{rows}x{columns}] cublas={baseline * 1000:.0f}us "
             f"chosen={best} at {best_ms * 1000:.0f}us"
         )
         return best
+
+    def _residual_agrees(self, config, x, weight, out) -> bool:
+        """The epilogue is a separate code path, so check it separately."""
+        try:
+            residual = torch.randn(
+                (x.shape[0], weight.shape[0]), device=DEVICE, dtype=torch.bfloat16
+            )
+            want = residual + F.linear(x, weight)
+            gemm.run(x, weight, out, config, residual=residual)
+            torch.cuda.synchronize()
+            return self._agrees(out, want)
+        except Exception:  # noqa: BLE001
+            return False
 
     def _build_rope_tables(self, capacity: int) -> None:
         """Tabulate per-position cos/sin.
@@ -515,9 +548,12 @@ class Engine:
             )
         # Group-major flatten restores head order 0..31 for o_proj.
         attended = attended.reshape(batch, 1, -1)
-        hidden = residual + self._fast_linear(attn.o_proj.weight, attended)
-        return hidden + self._mlp(
-            layer, self._norm(layer.post_attention_layernorm, hidden), fast=True
+        hidden = self._fast_linear(attn.o_proj.weight, attended, residual=residual)
+        return self._mlp(
+            layer,
+            self._norm(layer.post_attention_layernorm, hidden),
+            fast=True,
+            residual=hidden,
         )
 
     @torch.inference_mode()
