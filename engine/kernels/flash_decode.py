@@ -35,6 +35,7 @@ def _split_attention(
     acc_ptr,
     max_ptr,
     sum_ptr,
+    out_ptr,
     scale,
     CAP: tl.constexpr,
     G: tl.constexpr,
@@ -42,6 +43,7 @@ def _split_attention(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     SPLITS: tl.constexpr,
+    SINGLE: tl.constexpr,
 ):
     head = tl.program_id(0)
     split = tl.program_id(1)
@@ -95,6 +97,16 @@ def _split_attention(
         )
         acc += tl.dot(probs.to(v.dtype), v)
         running_max = block_max
+
+    if SINGLE:
+        # One split covers every key, so there is nothing to combine and the
+        # divide belongs here rather than in a second launch.
+        tl.store(
+            out_ptr + head * (G * D) + rows[:, None] * D + dims[None, :],
+            (acc / running_sum[:, None]).to(out_ptr.dtype.element_ty),
+            mask=row_mask[:, None],
+        )
+        return
 
     # Partials stay unnormalized; the combine pass holds the only divide.
     out_base = head * (SPLITS * BLOCK_M * D) + split * (BLOCK_M * D)
@@ -181,11 +193,13 @@ def flash_decode(query, keys, values, length, out, acc_buf, max_buf, sum_buf,
     programs = batch * heads
 
     _split_attention[(programs, splits)](
-        query, keys, values, length, acc_buf, max_buf, sum_buf, scale,
+        query, keys, values, length, acc_buf, max_buf, sum_buf, out, scale,
         CAP=capacity, G=groups, D=head_dim,
-        BLOCK_M=BLOCK_M, BLOCK_N=block_n, SPLITS=splits,
+        BLOCK_M=BLOCK_M, BLOCK_N=block_n, SPLITS=splits, SINGLE=splits == 1,
         num_warps=4, num_stages=2,
     )
+    if splits == 1:
+        return
     _combine_splits[(programs,)](
         acc_buf, max_buf, sum_buf, out,
         G=groups, D=head_dim, BLOCK_M=BLOCK_M, SPLITS=splits,

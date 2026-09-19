@@ -25,10 +25,8 @@ DEVICE = "cuda:0"
 #: but nothing requires one D2H copy per step, and the copy costs a stall.
 SYNC_CHUNK = 1024
 
-#: A challenger must beat the incumbent by this much to be adopted. Without a
-#: margin the autotune flips between near-equal candidates on timing noise,
-#: and an unlucky warmup then slows the whole run.
-SWITCH_MARGIN = 0.97
+#: Activate gate/up inside the down projection instead of in its own launch.
+USE_SWIGLU_EPILOGUE = True
 
 #: Tolerance for accepting a custom GEMM against cuBLAS. Both accumulate in
 #: fp32 and round once, so a correct kernel lands far inside this.
@@ -67,29 +65,19 @@ def _torch_linear(weight, x):
     return F.linear(x, weight)
 
 
-def _time_ms(call, iterations: int = 60, sweeps: int = 3) -> float:
-    """Best observed device time for a launch, used only during warmup.
-
-    Taking the minimum across several sweeps rather than one average matters
-    more than it looks. These launches are tens of microseconds, so a single
-    average is easily skewed by whatever else the device is doing, and the
-    autotune then locks in a worse config for the entire run. The minimum is
-    the closest thing to the launch's own cost, and it is stable.
-    """
-    for _ in range(10):
+def _time_ms(call, iterations: int = 25) -> float:
+    """Median-ish device time for a launch, used only during warmup."""
+    for _ in range(5):
         call()
     torch.cuda.synchronize()
-    best = float("inf")
     start = torch.cuda.Event(enable_timing=True)
     stop = torch.cuda.Event(enable_timing=True)
-    for _ in range(sweeps):
-        start.record()
-        for _ in range(iterations):
-            call()
-        stop.record()
-        torch.cuda.synchronize()
-        best = min(best, start.elapsed_time(stop) / iterations)
-    return best
+    start.record()
+    for _ in range(iterations):
+        call()
+    stop.record()
+    torch.cuda.synchronize()
+    return start.elapsed_time(stop) / iterations
 
 
 class Engine:
@@ -129,6 +117,7 @@ class Engine:
         self._fused_swiglu = False
         self._fused_qkv = False
         self._gemm_norm = False
+        self._gemm_swiglu = False
         self._batch = 0
         self._capacity = 0
         self._graph = None
@@ -184,6 +173,10 @@ class Engine:
         linear = self._fast_linear if fast else _torch_linear
         if fast:
             gate_up = self._fast_linear(layer.mlp.gateup_weight, hidden, norm=norm)
+            if self._gemm_swiglu:
+                return self._fast_linear(
+                    layer.mlp.down_proj.weight, gate_up, residual=residual, swiglu=True
+                )
         else:
             if norm is not None:
                 hidden = self._norm(norm, hidden)
@@ -224,11 +217,33 @@ class Engine:
         self._fused_swiglu = self._check(lambda: self._try_swiglu(batch))
         self._fused_qkv = self._check(lambda: self._try_qkv(batch))
         self._gemm_norm = self._check(lambda: self._try_gemm_norm(batch))
+        self._gemm_swiglu = USE_SWIGLU_EPILOGUE and self._check(
+            lambda: self._try_gemm_swiglu(batch)
+        )
         _log(
             f"fusions norm={self._fused_norm} rope={self._fused_rope} "
             f"swiglu={self._fused_swiglu} qkv={self._fused_qkv} "
-            f"gemm_norm={self._gemm_norm}"
+            f"gemm_norm={self._gemm_norm} gemm_swiglu={self._gemm_swiglu}"
         )
+
+    def _try_gemm_swiglu(self, batch: int) -> bool:
+        """Check the down projection's fused activation against silu-then-matmul."""
+        weight = self.layers[0].mlp.down_proj.weight
+        config = self._gemm_plan.get(tuple(weight.shape))
+        if config is None or len(config) == 5:
+            return False
+        gate_up = torch.randn(
+            (batch, 2 * self.mlp_size), device=DEVICE, dtype=torch.bfloat16
+        )
+        want = F.linear(
+            F.silu(gate_up[:, : self.mlp_size]) * gate_up[:, self.mlp_size :], weight
+        )
+        out = torch.empty(
+            (batch, weight.shape[0]), device=DEVICE, dtype=torch.bfloat16
+        )
+        gemm.run(gate_up, weight, out, config, swiglu=True)
+        torch.cuda.synchronize()
+        return self._agrees(out, want)
 
     def _try_gemm_norm(self, batch: int) -> bool:
         """Check the GEMM's fused RMSNorm against norm-then-matmul.
@@ -334,7 +349,7 @@ class Engine:
 
     # ------------------------------------------------------------ projections
 
-    def _fast_linear(self, weight, x, residual=None, norm=None):
+    def _fast_linear(self, weight, x, residual=None, norm=None, swiglu=False):
         """Decode-path matmul, using whichever of cuBLAS or Triton won at warmup.
 
         ``residual`` and ``norm`` are folded into the kernel when the custom
@@ -358,6 +373,7 @@ class Engine:
             residual=None if residual is None else residual.reshape(rows, -1),
             gain=norm.weight if fused_norm else None,
             eps=norm.variance_epsilon if fused_norm else 0.0,
+            swiglu=swiglu,
         )
         return out.view(rows, 1, -1)
 
@@ -409,7 +425,7 @@ class Engine:
                 elapsed = _time_ms(lambda: gemm.run(x, weight, out, config))
             except Exception:  # noqa: BLE001 - a bad config is just not chosen
                 continue
-            if elapsed < best_ms * SWITCH_MARGIN:
+            if elapsed < best_ms:
                 best, best_ms = config, elapsed
 
         if best is not None and not self._residual_agrees(best, x, weight, out):
@@ -556,7 +572,7 @@ class Engine:
                     )
                 except Exception:  # noqa: BLE001
                     continue
-                if elapsed < best_ms * SWITCH_MARGIN:
+                if elapsed < best_ms:
                     best, best_ms = (splits, block_n), elapsed
 
         if best is not None:
