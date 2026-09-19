@@ -129,6 +129,7 @@ class Engine:
         self._fused_swiglu = False
         self._fused_qkv = False
         self._gemm_norm = False
+        self._gemm_activate = False
         self._batch = 0
         self._capacity = 0
         self._graph = None
@@ -184,6 +185,10 @@ class Engine:
         linear = self._fast_linear if fast else _torch_linear
         if fast:
             gate_up = self._fast_linear(layer.mlp.gateup_weight, hidden, norm=norm)
+            if self._gemm_activate:
+                return self._fast_linear(
+                    layer.mlp.down_proj.weight, gate_up, residual=residual, activate=True
+                )
         else:
             if norm is not None:
                 hidden = self._norm(norm, hidden)
@@ -224,11 +229,47 @@ class Engine:
         self._fused_swiglu = self._check(lambda: self._try_swiglu(batch))
         self._fused_qkv = self._check(lambda: self._try_qkv(batch))
         self._gemm_norm = self._check(lambda: self._try_gemm_norm(batch))
+        self._gemm_activate = self._check(lambda: self._try_gemm_activate(batch))
         _log(
             f"fusions norm={self._fused_norm} rope={self._fused_rope} "
             f"swiglu={self._fused_swiglu} qkv={self._fused_qkv} "
-            f"gemm_norm={self._gemm_norm}"
+            f"gemm_norm={self._gemm_norm} gemm_activate={self._gemm_activate}"
         )
+
+    def _try_gemm_activate(self, batch: int) -> bool:
+        """The SwiGLU-on-load down projection must match SwiGLU then GEMM.
+
+        Both round at the same points and feed the same kernel, so the check
+        is for equality, and it must also not be slower than the pair.
+        """
+        weight = self.layers[0].mlp.down_proj.weight
+        config = self._gemm_plan.get(tuple(weight.shape))
+        if config is None or not self._fused_swiglu:
+            return False
+        gate_up = torch.randn(
+            (batch, 2 * self.mlp_size), device=DEVICE, dtype=torch.bfloat16
+        )
+        residual = torch.randn((batch, weight.shape[0]), device=DEVICE, dtype=torch.bfloat16)
+        fused = torch.empty_like(residual)
+        plain = torch.empty_like(residual)
+
+        def two_launch():
+            gemm.run(gate_up, weight, plain, config, residual=residual)
+            elementwise.swiglu(gate_up)
+
+        for _ in range(8):
+            gate_up.normal_()
+            gemm.run(gate_up, weight, fused, config, residual=residual, activate=True)
+            gemm.run(elementwise.swiglu(gate_up), weight, plain, config, residual=residual)
+            torch.cuda.synchronize()
+            if not torch.equal(fused, plain):
+                return False
+        one = _time_ms(
+            lambda: gemm.run(gate_up, weight, fused, config, residual=residual, activate=True)
+        )
+        two = _time_ms(two_launch)
+        _log(f"down_proj swiglu-on-load {one * 1000:.0f}us vs two launches {two * 1000:.0f}us")
+        return one <= two
 
     def _try_gemm_norm(self, batch: int) -> bool:
         """Check the GEMM's fused RMSNorm against norm-then-matmul.
@@ -334,7 +375,7 @@ class Engine:
 
     # ------------------------------------------------------------ projections
 
-    def _fast_linear(self, weight, x, residual=None, norm=None):
+    def _fast_linear(self, weight, x, residual=None, norm=None, activate=False):
         """Decode-path matmul, using whichever of cuBLAS or Triton won at warmup.
 
         ``residual`` and ``norm`` are folded into the kernel when the custom
@@ -358,6 +399,7 @@ class Engine:
             residual=None if residual is None else residual.reshape(rows, -1),
             gain=norm.weight if fused_norm else None,
             eps=norm.variance_epsilon if fused_norm else 0.0,
+            activate=activate,
         )
         return out.view(rows, 1, -1)
 

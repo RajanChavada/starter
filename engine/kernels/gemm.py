@@ -70,6 +70,23 @@ SPLIT_MAX_N = 4096
 
 
 @triton.jit
+def _load_x(x_ptr, offs_m, offs_k, mask, K, ACTIVATE: tl.constexpr):
+    """One [BLOCK_M, BLOCK_K] tile of the activation.
+
+    With ACTIVATE, ``x_ptr`` is the [M, 2K] gate/up projection and the tile is
+    silu(gate) * up computed here instead of by the SwiGLU launch, with the
+    same bf16 rounding points as ``elementwise._swiglu_kernel``.
+    """
+    if ACTIVATE:
+        row = offs_m[:, None] * (2 * K)
+        gate = tl.load(x_ptr + row + offs_k[None, :], mask=mask, other=0.0).to(tl.float32)
+        up = tl.load(x_ptr + row + K + offs_k[None, :], mask=mask, other=0.0).to(tl.float32)
+        activated = (gate * tl.sigmoid(gate)).to(tl.bfloat16).to(tl.float32)
+        return (activated * up).to(tl.bfloat16)
+    return tl.load(x_ptr + offs_m[:, None] * K + offs_k[None, :], mask=mask, other=0.0)
+
+
+@triton.jit
 def _split_gemm(
     x_ptr,
     w_ptr,
@@ -77,6 +94,7 @@ def _split_gemm(
     M,
     N,
     K,
+    ACTIVATE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -97,11 +115,7 @@ def _split_gemm(
     for k0 in range(start, stop, BLOCK_K):
         offs_k = k0 + tl.arange(0, BLOCK_K)
         k_live = offs_k < stop
-        x = tl.load(
-            x_ptr + offs_m[:, None] * K + offs_k[None, :],
-            mask=m_live[:, None] & k_live[None, :],
-            other=0.0,
-        )
+        x = _load_x(x_ptr, offs_m, offs_k, m_live[:, None] & k_live[None, :], K, ACTIVATE)
         w = tl.load(
             w_ptr + offs_n[:, None] * K + offs_k[None, :],
             mask=n_live[:, None] & k_live[None, :],
@@ -128,6 +142,7 @@ def _split_gemm_fixup(
     N,
     K,
     HAS_RESIDUAL: tl.constexpr,
+    ACTIVATE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -158,11 +173,7 @@ def _split_gemm_fixup(
     for k0 in range(start, stop, BLOCK_K):
         offs_k = k0 + tl.arange(0, BLOCK_K)
         k_live = offs_k < stop
-        x = tl.load(
-            x_ptr + offs_m[:, None] * K + offs_k[None, :],
-            mask=m_live[:, None] & k_live[None, :],
-            other=0.0,
-        )
+        x = _load_x(x_ptr, offs_m, offs_k, m_live[:, None] & k_live[None, :], K, ACTIVATE)
         w = tl.load(
             w_ptr + offs_n[:, None] * K + offs_k[None, :],
             mask=n_live[:, None] & k_live[None, :],
@@ -249,6 +260,7 @@ def _skinny_gemm(
     eps,
     HAS_RESIDUAL: tl.constexpr,
     NORMALIZE: tl.constexpr,
+    ACTIVATE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -281,11 +293,7 @@ def _skinny_gemm(
     for k0 in range(0, K, BLOCK_K):
         offs_k = k0 + tl.arange(0, BLOCK_K)
         k_live = offs_k < K
-        x = tl.load(
-            x_ptr + offs_m[:, None] * K + offs_k[None, :],
-            mask=m_live[:, None] & k_live[None, :],
-            other=0.0,
-        )
+        x = _load_x(x_ptr, offs_m, offs_k, m_live[:, None] & k_live[None, :], K, ACTIVATE)
         if NORMALIZE:
             # Round the normalized value to bf16 before the gain multiply,
             # which is where Qwen3RMSNorm puts its cast.
@@ -319,15 +327,20 @@ def _skinny_gemm(
     )
 
 
-def run(x, weight, out, config, residual=None, gain=None, eps=0.0) -> None:
+def run(x, weight, out, config, residual=None, gain=None, eps=0.0, activate=False) -> None:
     """x is [M, K], weight is [N, K], out is [M, N]; all contiguous bf16.
 
     ``residual``, if given, is [M, N] and is added in the epilogue, folding
     what would otherwise be a separate launch per residual branch per layer.
     ``gain``, if given, is the [K] RMSNorm weight applied to ``x`` before the
-    product, folding the pre-matmul norm in the same way.
+    product, folding the pre-matmul norm in the same way. With ``activate``,
+    ``x`` is the [M, 2K] gate/up projection and silu(gate) * up is formed on
+    load, folding the SwiGLU launch.
     """
     rows, k = x.shape
+    if activate:
+        assert gain is None
+        k //= 2
     n = weight.shape[0]
 
     if len(config) == 5:
@@ -339,14 +352,14 @@ def run(x, weight, out, config, residual=None, gain=None, eps=0.0) -> None:
             _split_gemm_fixup[(triton.cdiv(n, block_n), split_k)](
                 x, weight, residual if residual is not None else out,
                 partials, _lock_buffer(x.device), out, rows, n, k,
-                HAS_RESIDUAL=residual is not None,
+                HAS_RESIDUAL=residual is not None, ACTIVATE=activate,
                 BLOCK_M=block_m_for(rows), BLOCK_N=block_n,
                 BLOCK_K=block_k, SPLIT_K=split_k,
                 num_warps=warps, num_stages=stages,
             )
             return
         _split_gemm[(triton.cdiv(n, block_n), split_k)](
-            x, weight, partials, rows, n, k,
+            x, weight, partials, rows, n, k, ACTIVATE=activate,
             BLOCK_M=block_m_for(rows), BLOCK_N=block_n,
             BLOCK_K=block_k, SPLIT_K=split_k,
             num_warps=warps, num_stages=stages,
@@ -369,6 +382,7 @@ def run(x, weight, out, config, residual=None, gain=None, eps=0.0) -> None:
         rows, n, k, eps,
         HAS_RESIDUAL=residual is not None,
         NORMALIZE=gain is not None,
+        ACTIVATE=activate,
         BLOCK_M=block_m_for(rows), BLOCK_N=block_n, BLOCK_K=block_k,
         num_warps=warps, num_stages=stages,
     )
