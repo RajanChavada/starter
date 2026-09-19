@@ -224,6 +224,113 @@ def _skinny_gemm(
     )
 
 
+@triton.jit
+def _gateup_swiglu(
+    x_ptr,
+    w_ptr,
+    g_ptr,
+    o_ptr,
+    M,
+    N,
+    K,
+    eps,
+    NORMALIZE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """gate/up projection with silu(gate) * up applied in the epilogue.
+
+    ``w_ptr`` is the concatenated [2N, K] gate/up weight; a program owns the
+    same BLOCK_N columns of both halves, so the activation never round-trips
+    through HBM and the separate SwiGLU launch disappears. Each intermediate
+    is rounded to bf16 exactly where the unfused path rounds it.
+    """
+    pid = tl.program_id(0)
+    offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_m = tl.arange(0, BLOCK_M)
+    n_live = offs_n < N
+    m_live = offs_m < M
+
+    inv = tl.zeros((BLOCK_M,), tl.float32)
+    if NORMALIZE:
+        squares = tl.zeros((BLOCK_M,), tl.float32)
+        for k0 in range(0, K, BLOCK_K):
+            offs_k = k0 + tl.arange(0, BLOCK_K)
+            k_live = offs_k < K
+            chunk = tl.load(
+                x_ptr + offs_m[:, None] * K + offs_k[None, :],
+                mask=m_live[:, None] & k_live[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            squares += tl.sum(chunk * chunk, axis=1)
+        inv = tl.math.rsqrt(squares / K + eps)
+
+    acc_gate = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
+    acc_up = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
+    for k0 in range(0, K, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)
+        k_live = offs_k < K
+        x = tl.load(
+            x_ptr + offs_m[:, None] * K + offs_k[None, :],
+            mask=m_live[:, None] & k_live[None, :],
+            other=0.0,
+        )
+        if NORMALIZE:
+            normed = (x.to(tl.float32) * inv[:, None]).to(tl.bfloat16)
+            gain = tl.load(g_ptr + offs_k, mask=k_live, other=0.0)
+            x = (normed.to(tl.float32) * gain[None, :].to(tl.float32)).to(tl.bfloat16)
+        tile_mask = n_live[:, None] & k_live[None, :]
+        w_gate = tl.load(
+            w_ptr + offs_n[:, None] * K + offs_k[None, :], mask=tile_mask, other=0.0
+        )
+        w_up = tl.load(
+            w_ptr + (offs_n[:, None] + N) * K + offs_k[None, :],
+            mask=tile_mask,
+            other=0.0,
+        )
+        acc_gate += tl.dot(x, tl.trans(w_gate))
+        acc_up += tl.dot(x, tl.trans(w_up))
+
+    gate = acc_gate.to(tl.bfloat16).to(tl.float32)
+    up = acc_up.to(tl.bfloat16).to(tl.float32)
+    activated = (gate * tl.sigmoid(gate)).to(tl.bfloat16).to(tl.float32)
+    tl.store(
+        o_ptr + offs_m[:, None] * N + offs_n[None, :],
+        (activated * up).to(o_ptr.dtype.element_ty),
+        mask=m_live[:, None] & n_live[None, :],
+    )
+
+
+#: (BLOCK_N, BLOCK_K, num_warps, num_stages) for the fused gate/up + SwiGLU
+#: kernel. A program streams two BLOCK_N-row slabs, so BLOCK_N=32 gives the
+#: same 304 programs as the pinned 64-wide plain projection.
+GATEUP_SWIGLU_CONFIGS = (
+    (32, 128, 4, 4),
+    (32, 256, 4, 3),
+    (16, 256, 4, 3),
+    (64, 128, 4, 4),
+    (64, 64, 4, 4),
+)
+
+
+def run_gateup_swiglu(x, weight, out, config, gain=None, eps=0.0) -> None:
+    """x is [M, K], weight is the [2N, K] gate/up concat, out is [M, N]."""
+    rows, k = x.shape
+    n = weight.shape[0] // 2
+    block_n, block_k, warps, stages = config
+    _gateup_swiglu[(triton.cdiv(n, block_n),)](
+        x,
+        weight,
+        gain if gain is not None else x,
+        out,
+        rows, n, k, eps,
+        NORMALIZE=gain is not None,
+        BLOCK_M=block_m_for(rows), BLOCK_N=block_n, BLOCK_K=block_k,
+        num_warps=warps, num_stages=stages,
+    )
+
+
 def run(x, weight, out, config, residual=None, gain=None, eps=0.0) -> None:
     """x is [M, K], weight is [N, K], out is [M, N]; all contiguous bf16.
 

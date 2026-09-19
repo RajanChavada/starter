@@ -1,0 +1,3 @@
+#!/bin/sh
+# Runs the pinned Dryft CLI inside ubuntu:24.04 (host glibc is too old for the binary).
+exec docker run --rm -i -v "$HOME/starter:/w" -w /w -e DRYFT_TOKEN -e DRYFT_API=https://htn.dryft.ai ubuntu:24.04 ./bin/dryft "$@"

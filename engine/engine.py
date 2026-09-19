@@ -120,6 +120,7 @@ class Engine:
         self._fused_swiglu = False
         self._fused_qkv = False
         self._gemm_norm = False
+        self._swiglu_config = None
         self._batch = 0
         self._capacity = 0
         self._graph = None
@@ -173,6 +174,22 @@ class Engine:
 
     def _mlp(self, layer, hidden, fast: bool = False, residual=None, norm=None):
         linear = self._fast_linear if fast else _torch_linear
+        if fast and self._swiglu_config is not None:
+            rows = hidden.shape[0]
+            activated = torch.empty(
+                (rows, 1, self.mlp_size), dtype=hidden.dtype, device=hidden.device
+            )
+            gemm.run_gateup_swiglu(
+                hidden.reshape(rows, -1),
+                layer.mlp.gateup_weight,
+                activated.view(rows, -1),
+                self._swiglu_config,
+                gain=norm.weight,
+                eps=norm.variance_epsilon,
+            )
+            return self._fast_linear(
+                layer.mlp.down_proj.weight, activated, residual=residual
+            )
         if fast:
             gate_up = self._fast_linear(layer.mlp.gateup_weight, hidden, norm=norm)
         else:
@@ -215,11 +232,68 @@ class Engine:
         self._fused_swiglu = self._check(lambda: self._try_swiglu(batch))
         self._fused_qkv = self._check(lambda: self._try_qkv(batch))
         self._gemm_norm = self._check(lambda: self._try_gemm_norm(batch))
+        self._swiglu_config = None
+        if self._gemm_norm:
+            try:
+                self._swiglu_config = self._plan_gateup_swiglu(batch)
+            except Exception as error:  # noqa: BLE001 - keep the two-launch path
+                _log(f"gateup+swiglu unusable: {type(error).__name__}: {error}")
+                self._swiglu_config = None
         _log(
             f"fusions norm={self._fused_norm} rope={self._fused_rope} "
             f"swiglu={self._fused_swiglu} qkv={self._fused_qkv} "
-            f"gemm_norm={self._gemm_norm}"
+            f"gemm_norm={self._gemm_norm} gateup_swiglu={self._swiglu_config}"
         )
+
+    def _plan_gateup_swiglu(self, batch: int):
+        """Time the fused gate/up + SwiGLU kernel against the two-launch path.
+
+        Correctness is checked against norm -> linear -> silu * up in torch;
+        the winner must beat the adopted gate/up GEMM plus the SwiGLU launch
+        it replaces, or the two-launch path stays.
+        """
+        mlp = self.layers[0].mlp
+        norm = self.layers[0].post_attention_layernorm
+        weight = mlp.gateup_weight
+        plain = self._gemm_plan.get(tuple(weight.shape))
+        if plain is None:
+            return None
+
+        x = torch.randn((batch, weight.shape[1]), device=DEVICE, dtype=torch.bfloat16)
+        gate_up = F.linear(norm(x), weight)
+        want = F.silu(gate_up[:, : self.mlp_size]) * gate_up[:, self.mlp_size :]
+        out = torch.empty((batch, self.mlp_size), device=DEVICE, dtype=torch.bfloat16)
+        wide = torch.empty((batch, 2 * self.mlp_size), device=DEVICE, dtype=torch.bfloat16)
+
+        def two_launch():
+            gemm.run(x, weight, wide, plain, gain=norm.weight, eps=norm.variance_epsilon)
+            elementwise.swiglu(wide)
+
+        baseline = _time_ms(two_launch)
+        best, best_ms = None, baseline
+        for config in gemm.GATEUP_SWIGLU_CONFIGS:
+            try:
+                gemm.run_gateup_swiglu(
+                    x, weight, out, config, gain=norm.weight, eps=norm.variance_epsilon
+                )
+                torch.cuda.synchronize()
+                if not self._agrees(out, want):
+                    continue
+                elapsed = _time_ms(
+                    lambda: gemm.run_gateup_swiglu(
+                        x, weight, out, config,
+                        gain=norm.weight, eps=norm.variance_epsilon,
+                    )
+                )
+            except Exception:  # noqa: BLE001 - a bad config is just not chosen
+                continue
+            if elapsed < best_ms:
+                best, best_ms = config, elapsed
+        _log(
+            f"gateup+swiglu two_launch={baseline * 1000:.0f}us "
+            f"chosen={best} at {best_ms * 1000:.0f}us"
+        )
+        return best
 
     def _try_gemm_norm(self, batch: int) -> bool:
         """Check the GEMM's fused RMSNorm against norm-then-matmul.
@@ -731,8 +805,10 @@ class Engine:
         a bare graph replay is a complete step with no host work in between.
         """
         hidden = self.base.embed_tokens(self.step_token)
-        cos = self.cos_table.index_select(0, self.cur_pos).view(1, 1, 1, self.head_dim)
-        sin = self.sin_table.index_select(0, self.cur_pos).view(1, 1, 1, self.head_dim)
+        cos = sin = None
+        if not self._fused_qkv:
+            cos = self.cos_table.index_select(0, self.cur_pos).view(1, 1, 1, self.head_dim)
+            sin = self.sin_table.index_select(0, self.cur_pos).view(1, 1, 1, self.head_dim)
         # The slot about to be written is live, so the count is cur_pos + 1.
         # Capacity past it holds stale values and must never be read.
         torch.add(self.cur_pos, 1, out=self.valid_len)
