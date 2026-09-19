@@ -382,6 +382,10 @@ class Engine:
         if rows <= gemm.SPLIT_MAX_N:
             # Narrow outputs cannot fill the device by tiling N alone.
             candidates = candidates + gemm.SPLIT_CONFIGS
+        elif rows <= gemm.WIDE_SPLIT_MAX_N:
+            # QKV is wide enough to miss the narrow-path heuristic, but at
+            # batch 1 it still supplies fewer tiles than there are H100 SMs.
+            candidates = candidates + gemm.WIDE_SPLIT_CONFIGS
 
         best, best_ms = None, baseline
         for config in candidates:
