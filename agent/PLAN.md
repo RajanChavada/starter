@@ -255,6 +255,40 @@ so it is the verification step — no local or rented GPU required.
 | flash decode + fused projections + fallbacks | 5d2189a / f587d356 | 116.1 | 268.2 | 1514.3 | 479.4 | New banked best. TPOT ratios 0.22/0.24/0.24x native. Correctness and latency gates passed. |
 | skinny GEMM + chunked sync | c78533f / 8f04a7b3 | 125.2 | 273.2 | 1558.4 | 495.7 | New banked best. Candidate ms improved to 255.6/468.5/1314.2. |
 | fused RMSNorm + RoPE + SwiGLU | f4b49b6 / 3578a1ff | 188.5 | 383.9 | 2399.7 | 743.5 | New banked best. Candidate ms 169.7/333.4/853.4, TTFT 0.65/0.74/0.73x native. |
+| residual epilogue + 12-config autotune | 7b48455 | | | | 719.1 | noise band |
+| norm+rotary+cache write in one kernel | 9fb9dbd | | | | 780.8 | +5% over f4b49b6 |
+| attention autotune + RMSNorm into GEMM | 7c2a739 | | | | 772.5 | noise band |
+| autotune narrowed to 6 configs | 3c5eb28 | | | | 796.5 | p0 tpot 4.47 |
+| residual epilogue off | 9db3ed8 | | | | 762.3 | noise band |
+| SwiGLU epilogue + sync 16 | 23496cb | | | | 747.0 | noise band |
+| speculative decoding | 47335e6 | | | | 507.6 | **real regression**, p0 tpot 7.39. Abandoned. |
+| verification via fused path | 5db42b5 | | | | 513.6 | stacked on the above |
+| residual epilogue restored | 629e156 | | | | 499.8 | stacked on the above |
+| revert to 3c5eb28 tree, byte identical | c9a7ac6 | | | | 766.3 | **p0 tpot 5.55 vs 4.47 for the same code** |
+| split-K for narrow projections | 4f7c38f | 204.4 | 412.6 | 2483.6 | **799.7** | p0 tpot 4.51. Best. |
+| reproducible autotune | 84c5d62 | | | | pending | |
+
+## Two things that govern how results must be read
+
+**Run-to-run noise on the score is about 4%.** Anything smaller carries no
+information. Several reverts above were chasing noise and cost cycles.
+
+**The autotune is itself a variance source, and a bigger one.** c9a7ac6 was
+byte-identical to 3c5eb28 and measured 766.3 / 5.55 ms against 796.5 / 4.47 ms.
+A 24% swing in time per token from identical code means warmup was picking
+different GEMM configs on different runs -- it times launches lasting tens of
+microseconds, so interference during warmup can lock in a worse config for
+every sample in that workload. Fixing the measurement (minimum of several
+sweeps, plus a margin before switching) is worth more than most kernel work,
+because the good configuration already existed; we were just failing to find
+it reliably.
+
+**Speculative decoding lost badly here** and is abandoned: 747 -> 507, with
+the step going 4.73 -> 7.39 ms. Verification runs the full model over five
+positions, and the per-step host work -- building drafts, uploading them,
+reading predictions back -- reintroduces exactly the synchronisation the
+graphed single-token path had removed. At 32-128 output tokens there is not
+enough repetition for acceptance to pay for that.
 | residual epilogue + 12-config autotune | 7b48455 | | | | 719.1 | Regression. Later split: the 12 configs were the loss, the epilogue a win. |
 | one kernel for norm+rotary+cache write | 9fb9dbd | | | | 780.8 | +8.5% while still carrying the 12-config loss. |
 | attention autotune + RMSNorm into GEMM | 7c2a739 | | | | 772.5 | Within noise. |
