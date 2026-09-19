@@ -287,7 +287,32 @@ so it is the verification step — no local or rented GPU required.
 
 | 1444d26 | restore of 4f7c38f tree | **failed** | 4.66 | `unstable_timing` |
 
-## The platform itself is unstable right now, and it matters
+## Machine health audit: only one run was affected
+
+Prefill is identical in every experiment, so TTFT is a clean indicator of how
+the box was performing. Across all 19 runs it sits at 15-22 / 148-152 /
+136-141 ms, with exactly one exception: 1444d26 at 21 / 319 / 317, the run
+that failed `unstable_timing`.
+
+So the platform was healthy for every other measurement, and the earlier
+reverts were justified after all -- 84c5d62 at 5.64, d8bee03 at 6.59 and
+005bc30 at 5.79 were all measured on healthy boxes and were real regressions.
+
+What the audit does confirm is the internal variance: 3c5eb28 and c9a7ac6 are
+byte-identical, both ran on healthy boxes, and measured 4.47 and 5.55 ms. A
+24% swing with the machine ruled out points back at the warmup autotune
+choosing different GEMM configs from one run to the next. That is the largest
+single lever left, and it is worth more than any kernel change still on the
+list: the fast configuration already exists, we just do not select it
+reliably.
+
+The fix attempted in 84c5d62 (minimum-of-sweeps timing plus a 3% adoption
+margin) made things worse, most likely because the margin biased selection
+back toward cuBLAS. The better approach is to remove the timing from the
+decision entirely and pin configs by a deterministic rule on shape, so the
+same tree always produces the same engine.
+
+## The platform is occasionally unstable too
 
 Run 6d2dd51e ran the byte-identical best tree and **failed the 25% spread
 gate**. Its public-0 step was 4.66 ms, right at our best, but public-1 and
