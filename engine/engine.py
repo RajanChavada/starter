@@ -587,6 +587,8 @@ class Engine:
 
         self._graph = None
         self._graph_shape = None
+        self._prefill_graph = None
+        self._prefill_shape = None
 
     def _attention_buffers(self, splits: int):
         heads = self._batch * self.n_kv_heads
@@ -886,6 +888,29 @@ class Engine:
         self.step_idx.add_(1)
         self.cur_pos.add_(1)
 
+    def _capture_prefill(self, batch: int, length: int) -> None:
+        """Capture prefill against fixed id and logit buffers.
+
+        At short prompts prefill is a few hundred launches over a few
+        milliseconds of GPU work, so the host issue rate sets the TTFT; the
+        graph removes it. Prefill only writes cache slots the real call
+        overwrites, so nothing has to be reset afterwards.
+        """
+        self.prefill_ids = torch.zeros((batch, length), dtype=torch.int64, device=DEVICE)
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(CAPTURE_WARMUP_STEPS):
+                self._prefill(self.prefill_ids)
+        torch.cuda.current_stream().wait_stream(stream)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            self.prefill_logits = self._prefill(self.prefill_ids)
+        self._prefill_graph = graph
+        self._prefill_shape = (batch, length)
+        _log(f"captured prefill graph batch={batch} prompt={length}")
+
     def _capture(self) -> None:
         """Capture the decode step, then wipe the state the capture dirtied.
 
@@ -954,12 +979,25 @@ class Engine:
                     keys.zero_()
                     values.zero_()
         use_graph = use_graph and self._graph is not None
+        if USE_CUDA_GRAPH and self._prefill_shape != (batch, prompt_length):
+            try:
+                self._capture_prefill(batch, prompt_length)
+            except Exception as error:  # noqa: BLE001 - eager prefill is exact too
+                _log(f"prefill capture failed, running eagerly: {type(error).__name__}: {error}")
+                self._prefill_graph = None
+                self._prefill_shape = None
         self._warmed = True
 
         with torch.inference_mode():
             ids = torch.tensor(input_ids, dtype=torch.int64, device=DEVICE)
             self.cur_pos.zero_()
-            first = self._prefill(ids)[:, -1, :].argmax(dim=-1, keepdim=True)
+            if self._prefill_graph is not None:
+                self.prefill_ids.copy_(ids)
+                self._prefill_graph.replay()
+                logits = self.prefill_logits
+            else:
+                logits = self._prefill(ids)
+            first = logits[:, -1, :].argmax(dim=-1, keepdim=True)
             self.step_token.copy_(first)
             # Prefill filled slots 0..S-1; the token just chosen lands at S.
             self.cur_pos.fill_(prompt_length)
