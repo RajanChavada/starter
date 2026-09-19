@@ -14,9 +14,19 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM
 
+from kernels import gemm
 from kernels.flash_decode import BLOCK_M, choose_splits, flash_decode
 
 DEVICE = "cuda:0"
+
+#: Decode steps run between device syncs. Each yield must still be one step,
+#: but nothing requires one D2H copy per step, and the copy costs a stall.
+SYNC_CHUNK = 8
+
+#: Tolerance for accepting a custom GEMM against cuBLAS. Both accumulate in
+#: fp32 and round once, so a correct kernel lands far inside this.
+GEMM_ATOL = 0.05
+GEMM_RTOL = 0.005
 
 #: Key block for the decode kernel's inner loop.
 DECODE_BLOCK_N = 64
@@ -44,6 +54,25 @@ def _log(message: str) -> None:
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     half = x.shape[-1] // 2
     return torch.cat((-x[..., half:], x[..., :half]), dim=-1)
+
+
+def _torch_linear(weight, x):
+    return F.linear(x, weight)
+
+
+def _time_ms(call, iterations: int = 25) -> float:
+    """Median-ish device time for a launch, used only during warmup."""
+    for _ in range(5):
+        call()
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    stop = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(iterations):
+        call()
+    stop.record()
+    torch.cuda.synchronize()
+    return start.elapsed_time(stop) / iterations
 
 
 class Engine:
@@ -77,6 +106,7 @@ class Engine:
 
         self._fuse_projections()
 
+        self._gemm_plan = {}
         self._batch = 0
         self._capacity = 0
         self._graph = None
@@ -128,11 +158,75 @@ class Engine:
             f"weights={torch.cuda.memory_allocated() / 2**30:.2f}GiB"
         )
 
-    def _mlp(self, layer, hidden):
-        gate_up = F.linear(hidden, layer.mlp.gateup_weight)
+    def _mlp(self, layer, hidden, fast: bool = False):
+        linear = self._fast_linear if fast else _torch_linear
+        gate_up = linear(layer.mlp.gateup_weight, hidden)
         gate = gate_up[..., : self.mlp_size]
         up = gate_up[..., self.mlp_size :]
-        return layer.mlp.down_proj(F.silu(gate) * up)
+        return linear(layer.mlp.down_proj.weight, F.silu(gate) * up)
+
+    # ------------------------------------------------------------ projections
+
+    def _fast_linear(self, weight, x):
+        """Decode-path matmul, using whichever of cuBLAS or Triton won at warmup."""
+        config = self._gemm_plan.get(tuple(weight.shape))
+        if config is None:
+            return F.linear(x, weight)
+        rows = x.shape[0]
+        out = torch.empty((rows, weight.shape[0]), dtype=x.dtype, device=x.device)
+        gemm.run(x.reshape(rows, -1), weight, out, config)
+        return out.view(rows, 1, -1)
+
+    def _plan_gemms(self, batch: int) -> None:
+        """Benchmark every projection shape, cuBLAS against each Triton config.
+
+        Warmup is untimed, so this is a free, workload-specific autotune. It
+        keeps cuBLAS unless a configuration is both correct and faster, which
+        makes adopting the custom kernel incapable of regressing the step.
+        """
+        self._gemm_plan = {}
+        first = self.layers[0]
+        for weight in (
+            first.self_attn.qkv_weight,
+            first.self_attn.o_proj.weight,
+            first.mlp.gateup_weight,
+            first.mlp.down_proj.weight,
+            self.model.lm_head.weight,
+        ):
+            key = tuple(weight.shape)
+            if key not in self._gemm_plan:
+                self._gemm_plan[key] = self._choose_gemm(weight, batch)
+
+    def _choose_gemm(self, weight, batch: int):
+        rows, columns = weight.shape
+        try:
+            x = torch.randn((batch, columns), device=DEVICE, dtype=torch.bfloat16)
+            out = torch.empty((batch, rows), device=DEVICE, dtype=torch.bfloat16)
+            reference = F.linear(x, weight)
+            baseline = _time_ms(lambda: F.linear(x, weight))
+            allowed = GEMM_ATOL + GEMM_RTOL * reference.float().abs().max().item()
+        except Exception as error:  # noqa: BLE001
+            _log(f"gemm plan skipped [{rows}x{columns}]: {type(error).__name__}")
+            return None
+
+        best, best_ms = None, baseline
+        for config in gemm.CONFIGS:
+            try:
+                gemm.run(x, weight, out, config)
+                torch.cuda.synchronize()
+                gap = (out.float() - reference.float()).abs().max().item()
+                if not gap <= allowed:
+                    continue
+                elapsed = _time_ms(lambda: gemm.run(x, weight, out, config))
+            except Exception:  # noqa: BLE001 - a bad config is just not chosen
+                continue
+            if elapsed < best_ms:
+                best, best_ms = config, elapsed
+        _log(
+            f"gemm [{rows}x{columns}] cublas={baseline * 1000:.0f}us "
+            f"chosen={best} at {best_ms * 1000:.0f}us"
+        )
+        return best
 
     def _build_rope_tables(self, capacity: int) -> None:
         """Tabulate per-position cos/sin.
@@ -174,6 +268,12 @@ class Engine:
         self.valid_len = torch.zeros(1, dtype=torch.int64, device=DEVICE)
         self.step_token = torch.zeros((batch, 1), dtype=torch.int64, device=DEVICE)
         self.next_token = torch.zeros((batch, 1), dtype=torch.int64, device=DEVICE)
+        self.step_idx = torch.zeros(1, dtype=torch.int64, device=DEVICE)
+        self.token_log = torch.zeros(
+            (capacity, batch), dtype=torch.int64, device=DEVICE
+        )
+
+        self._plan_gemms(batch)
 
         heads = batch * self.n_kv_heads
         self.splits = choose_splits(heads, capacity, DECODE_BLOCK_N)
@@ -306,7 +406,7 @@ class Engine:
         normed = layer.input_layernorm(hidden)
         batch = normed.shape[0]
 
-        qkv = F.linear(normed, attn.qkv_weight)
+        qkv = self._fast_linear(attn.qkv_weight, normed)
         q_end = self.q_size
         k_end = q_end + self.kv_size
         query = attn.q_norm(
@@ -337,8 +437,10 @@ class Engine:
             )
         # Group-major flatten restores head order 0..31 for o_proj.
         attended = attended.reshape(batch, 1, -1)
-        hidden = residual + attn.o_proj(attended)
-        return hidden + self._mlp(layer, layer.post_attention_layernorm(hidden))
+        hidden = residual + self._fast_linear(attn.o_proj.weight, attended)
+        return hidden + self._mlp(
+            layer, layer.post_attention_layernorm(hidden), fast=True
+        )
 
     @torch.inference_mode()
     def _decode_step(self) -> None:
@@ -361,10 +463,14 @@ class Engine:
 
         for index, layer in enumerate(self.layers):
             hidden = self._layer_decode(layer, index, hidden, cos, sin, mask)
-        logits = self.model.lm_head(self.base.norm(hidden))
+        logits = self._fast_linear(self.model.lm_head.weight, self.base.norm(hidden))
 
         self.next_token.copy_(logits[:, -1, :].argmax(dim=-1, keepdim=True))
         self.step_token.copy_(self.next_token)
+        # Tokens accumulate on device so the host can collect a chunk of steps
+        # with a single copy instead of stalling once per step.
+        self.token_log.index_copy_(0, self.step_idx, self.next_token.view(1, -1))
+        self.step_idx.add_(1)
         self.cur_pos.add_(1)
 
     def _capture(self) -> None:
@@ -379,11 +485,13 @@ class Engine:
             for _ in range(CAPTURE_WARMUP_STEPS):
                 self.cur_pos.zero_()
                 self.step_token.zero_()
+                self.step_idx.zero_()
                 self._decode_step()
         torch.cuda.current_stream().wait_stream(stream)
 
         self.cur_pos.zero_()
         self.step_token.zero_()
+        self.step_idx.zero_()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             self._decode_step()
@@ -442,11 +550,22 @@ class Engine:
             self.step_token.copy_(first)
             # Prefill filled slots 0..S-1; the token just chosen lands at S.
             self.cur_pos.fill_(prompt_length)
+            self.token_log[0].copy_(first[:, 0])
+            self.step_idx.fill_(1)
+            # First token goes out immediately; time to first token is a gate.
             yield first[:, 0].tolist()
 
-            for _ in range(max_new_tokens - 1):
-                if use_graph:
-                    self._graph.replay()
-                else:
-                    self._decode_step()
-                yield self.next_token[:, 0].tolist()
+            delivered = 1
+            while delivered < max_new_tokens:
+                chunk = min(SYNC_CHUNK, max_new_tokens - delivered)
+                for _ in range(chunk):
+                    if use_graph:
+                        self._graph.replay()
+                    else:
+                        self._decode_step()
+                # One device sync for the whole chunk, then replay it to the
+                # harness a step at a time. The tokens are bit-identical; only
+                # the number of stalls changes.
+                for row in self.token_log[delivered : delivered + chunk].tolist():
+                    yield row
+                delivered += chunk
