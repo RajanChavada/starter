@@ -268,6 +268,30 @@ so it is the verification step — no local or rented GPU required.
 | split-K for narrow projections | 4f7c38f | 204.4 | 412.6 | 2483.6 | **799.7** | p0 tpot 4.51. Best. |
 | reproducible autotune | 84c5d62 | | | | pending | |
 
+## Commit -> score ladder (p0 tpot is the number to drive down)
+
+| Commit | Change | Score | p0 tpot | Verdict |
+| --- | --- | ---: | ---: | --- |
+| f4b49b6 | fused RMSNorm/rotary/SwiGLU | 743.5 | 4.86 | win |
+| 9fb9dbd | norm+rotary+cache in one kernel | 780.8 | 4.60 | win |
+| 3c5eb28 | autotune narrowed to 6 configs | 796.5 | 4.47 | |
+| c9a7ac6 | 3c5eb28 tree, byte identical | 766.3 | 5.55 | same code, 24% apart |
+| **4f7c38f** | **split-K for narrow projections** | **799.7** | **4.51** | **BEST** |
+| 84c5d62 | reproducible autotune | 742.8 | 5.64 | reverted |
+| d8bee03 | swiglu epilogue + single-split + deep-K | 595.5 | 6.59 | reverted |
+| 005bc30 | pre-swizzled weight layout | 727.5 | 5.79 | reverted |
+| 1444d26 | restore of 4f7c38f tree | pending | | |
+
+Everything attempted after 4f7c38f has been a regression. The cheap
+launch-collapsing wins are spent, and the three structural attempts since
+(autotune margin, further epilogue fusion, weight relayout) all made the step
+slower rather than faster. Pre-swizzling is the most surprising: giving each
+program one contiguous tile instead of BLOCK_N strided runs should help
+streaming, and it cost 28%. The likely explanation is that the relayout adds
+~8GB of resident weights on top of the originals and the fused copies, and
+the extra footprint hurts more than the access pattern helps -- worth
+retrying only with the originals freed.
+
 ## Two things that govern how results must be read
 
 **Run-to-run noise on the score is about 4%.** Anything smaller carries no
