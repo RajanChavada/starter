@@ -268,7 +268,8 @@ so it is the verification step — no local or rented GPU required.
 | split-K for narrow projections | 4f7c38f | 204.4 | 412.6 | 2483.6 | **799.7** | p0 tpot 4.51. Best. |
 | reproducible autotune | 84c5d62 | | | | pending | |
 | replay-timed warmup autotune | 59425ba | | | | pending | queued |
-| aligned / evict-first GEMM loads | pending | | | | pending | submitting next |
+| aligned / evict-first GEMM loads | 8d22ca8 | | | | pending | queued |
+| eight-step decode graph replay | pending | | | | pending | submitting next |
 
 ## Commit -> score ladder (p0 tpot is the number to drive down)
 
@@ -284,6 +285,7 @@ so it is the verification step — no local or rented GPU required.
 | 005bc30 | pre-swizzled weight layout | 727.5 | 5.79 | reverted |
 | 1444d26 | restore of 4f7c38f tree | pending | | |
 | 59425ba | replay-timed warmup autotune | pending | | queued |
+| 8d22ca8 | aligned / evict-first GEMM loads | pending | | queued |
 
 | 1444d26 | restore of 4f7c38f tree | **failed** | 4.66 | `unstable_timing` |
 
