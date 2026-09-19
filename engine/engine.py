@@ -380,19 +380,23 @@ class Engine:
         if config is None:
             out = F.linear(x, weight)
             return out if residual is None else residual + out
-        rows = x.shape[0]
-        out = torch.empty((rows, weight.shape[0]), dtype=x.dtype, device=x.device)
+        # Flatten every leading dimension: decode passes [B, 1, K] and
+        # verification passes [B, T, K], and both are just rows to the kernel.
+        flat = x.reshape(-1, x.shape[-1])
+        out = torch.empty(
+            (flat.shape[0], weight.shape[0]), dtype=x.dtype, device=x.device
+        )
         gemm.run(
-            x.reshape(rows, -1),
+            flat,
             weight,
             out,
             config,
-            residual=None if residual is None else residual.reshape(rows, -1),
+            residual=None if residual is None else residual.reshape(-1, residual.shape[-1]),
             gain=norm.weight if fused_norm else None,
             eps=norm.variance_epsilon if fused_norm else 0.0,
             swiglu=swiglu,
         )
-        return out.view(rows, 1, -1)
+        return out.view(*x.shape[:-1], -1)
 
     def _plan_gemms(self, batch: int) -> None:
         """Benchmark every projection shape, cuBLAS against each Triton config.
@@ -828,11 +832,12 @@ class Engine:
         """
         attn = layer.self_attn
         residual = hidden
-        normed = self._norm(layer.input_layernorm, hidden)
-        batch, length, _ = normed.shape
+        batch, length, _ = hidden.shape
         head_shape = (batch, length, -1, self.head_dim)
 
-        qkv = F.linear(normed, attn.qkv_weight)
+        qkv = self._fast_linear(
+            attn.qkv_weight, hidden, norm=layer.input_layernorm
+        )
         q_end = self.q_size
         k_end = q_end + self.kv_size
         query = self._norm(attn.q_norm, qkv[..., :q_end].reshape(head_shape))
@@ -865,8 +870,14 @@ class Engine:
             batch, self.n_kv_heads, length, self.kv_groups, self.head_dim
         ).permute(0, 2, 1, 3, 4).reshape(batch, length, -1)
 
-        hidden = residual + F.linear(attended, attn.o_proj.weight)
-        return hidden + self._mlp(layer, hidden, norm=layer.post_attention_layernorm)
+        hidden = self._fast_linear(attn.o_proj.weight, attended, residual=residual)
+        return self._mlp(
+            layer,
+            hidden,
+            fast=True,
+            residual=hidden,
+            norm=layer.post_attention_layernorm,
+        )
 
     @torch.inference_mode()
     def _verify_step(self) -> None:
@@ -885,8 +896,8 @@ class Engine:
 
         for index, layer in enumerate(self.layers):
             hidden = self._layer_verify(layer, index, hidden, cos, sin, mask, slots)
-        logits = F.linear(
-            self._norm(self.base.norm, hidden), self.model.lm_head.weight
+        logits = self._fast_linear(
+            self.model.lm_head.weight, hidden, norm=self.base.norm
         )
         self.verify_pred.copy_(logits.argmax(dim=-1))
 
