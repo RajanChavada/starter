@@ -21,6 +21,9 @@ from kernels.rmsnorm import rms_norm
 
 DEVICE = "cuda:0"
 
+#: Fold the residual add into the GEMM store, rather than its own launch.
+USE_RESIDUAL_EPILOGUE = False
+
 #: Decode steps run between device syncs. Each yield must still be one step,
 #: but nothing requires one D2H copy per step, and the copy costs a stall.
 SYNC_CHUNK = 1024
@@ -326,6 +329,8 @@ class Engine:
         path is active, removing one launch each per layer. Either falls back
         to its own launch if the fused form was not adopted at warmup.
         """
+        if residual is not None and not USE_RESIDUAL_EPILOGUE:
+            return residual + self._fast_linear(weight, x, norm=norm)
         config = self._gemm_plan.get(tuple(weight.shape))
         fused_norm = norm is not None and config is not None and self._gemm_norm
         if norm is not None and not fused_norm:
