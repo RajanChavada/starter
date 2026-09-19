@@ -77,6 +77,7 @@ def _split_gemm(
     M,
     N,
     K,
+    EVEN_K: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -85,28 +86,47 @@ def _split_gemm(
     pid_n = tl.program_id(0)
     pid_k = tl.program_id(1)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_n = tl.max_contiguous(tl.multiple_of(offs_n, BLOCK_N), BLOCK_N)
     offs_m = tl.arange(0, BLOCK_M)
     n_live = offs_n < N
     m_live = offs_m < M
 
-    per_split = tl.cdiv(K, SPLIT_K)
+    # Rounded to a whole number of key blocks so every split starts at an
+    # address the compiler can see is 128-bit aligned. Which partial sums
+    # which slice of K changes; the fp32 total does not.
+    per_split = tl.cdiv(tl.cdiv(K, BLOCK_K), SPLIT_K) * BLOCK_K
     start = pid_k * per_split
     stop = tl.minimum(start + per_split, K)
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
     for k0 in range(start, stop, BLOCK_K):
         offs_k = k0 + tl.arange(0, BLOCK_K)
-        k_live = offs_k < stop
-        x = tl.load(
-            x_ptr + offs_m[:, None] * K + offs_k[None, :],
-            mask=m_live[:, None] & k_live[None, :],
-            other=0.0,
-        )
-        w = tl.load(
-            w_ptr + offs_n[:, None] * K + offs_k[None, :],
-            mask=n_live[:, None] & k_live[None, :],
-            other=0.0,
-        )
+        offs_k = tl.max_contiguous(tl.multiple_of(offs_k, BLOCK_K), BLOCK_K)
+        if EVEN_K:
+            x = tl.load(
+                x_ptr + offs_m[:, None] * K + offs_k[None, :],
+                mask=m_live[:, None],
+                other=0.0,
+            )
+            w = tl.load(
+                w_ptr + offs_n[:, None] * K + offs_k[None, :],
+                mask=n_live[:, None],
+                other=0.0,
+                eviction_policy="evict_first",
+            )
+        else:
+            k_live = offs_k < stop
+            x = tl.load(
+                x_ptr + offs_m[:, None] * K + offs_k[None, :],
+                mask=m_live[:, None] & k_live[None, :],
+                other=0.0,
+            )
+            w = tl.load(
+                w_ptr + offs_n[:, None] * K + offs_k[None, :],
+                mask=n_live[:, None] & k_live[None, :],
+                other=0.0,
+                eviction_policy="evict_first",
+            )
         acc += tl.dot(x, tl.trans(w))
 
     tl.store(
@@ -154,12 +174,14 @@ def _skinny_gemm(
     eps,
     HAS_RESIDUAL: tl.constexpr,
     NORMALIZE: tl.constexpr,
+    EVEN_K: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
     pid = tl.program_id(0)
     offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_n = tl.max_contiguous(tl.multiple_of(offs_n, BLOCK_N), BLOCK_N)
     offs_m = tl.arange(0, BLOCK_M)
     n_live = offs_n < N
     m_live = offs_m < M
@@ -173,35 +195,69 @@ def _skinny_gemm(
         squares = tl.zeros((BLOCK_M,), tl.float32)
         for k0 in range(0, K, BLOCK_K):
             offs_k = k0 + tl.arange(0, BLOCK_K)
-            k_live = offs_k < K
-            chunk = tl.load(
-                x_ptr + offs_m[:, None] * K + offs_k[None, :],
-                mask=m_live[:, None] & k_live[None, :],
-                other=0.0,
-            ).to(tl.float32)
+            offs_k = tl.max_contiguous(tl.multiple_of(offs_k, BLOCK_K), BLOCK_K)
+            if EVEN_K:
+                chunk = tl.load(
+                    x_ptr + offs_m[:, None] * K + offs_k[None, :],
+                    mask=m_live[:, None],
+                    other=0.0,
+                ).to(tl.float32)
+            else:
+                chunk = tl.load(
+                    x_ptr + offs_m[:, None] * K + offs_k[None, :],
+                    mask=m_live[:, None] & (offs_k[None, :] < K),
+                    other=0.0,
+                ).to(tl.float32)
             squares += tl.sum(chunk * chunk, axis=1)
         inv = tl.math.rsqrt(squares / K + eps)
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
     for k0 in range(0, K, BLOCK_K):
         offs_k = k0 + tl.arange(0, BLOCK_K)
-        k_live = offs_k < K
-        x = tl.load(
-            x_ptr + offs_m[:, None] * K + offs_k[None, :],
-            mask=m_live[:, None] & k_live[None, :],
-            other=0.0,
-        )
+        offs_k = tl.max_contiguous(tl.multiple_of(offs_k, BLOCK_K), BLOCK_K)
+        # A mask that varies along the contiguous axis costs the compiler its
+        # proof that the load is 128-bit wide, and it then emits narrow ones
+        # for the whole weight stream. Every K here divides every BLOCK_K, so
+        # the mask is dropped rather than paid for. Masking N is free: it is
+        # constant along the contiguous axis.
+        if EVEN_K:
+            x = tl.load(
+                x_ptr + offs_m[:, None] * K + offs_k[None, :],
+                mask=m_live[:, None],
+                other=0.0,
+            )
+        else:
+            x = tl.load(
+                x_ptr + offs_m[:, None] * K + offs_k[None, :],
+                mask=m_live[:, None] & (offs_k[None, :] < K),
+                other=0.0,
+            )
         if NORMALIZE:
             # Round the normalized value to bf16 before the gain multiply,
             # which is where Qwen3RMSNorm puts its cast.
             normed = (x.to(tl.float32) * inv[:, None]).to(tl.bfloat16)
-            gain = tl.load(g_ptr + offs_k, mask=k_live, other=0.0)
+            if EVEN_K:
+                gain = tl.load(g_ptr + offs_k)
+            else:
+                gain = tl.load(g_ptr + offs_k, mask=offs_k < K, other=0.0)
             x = (normed.to(tl.float32) * gain[None, :].to(tl.float32)).to(tl.bfloat16)
-        w = tl.load(
-            w_ptr + offs_n[:, None] * K + offs_k[None, :],
-            mask=n_live[:, None] & k_live[None, :],
-            other=0.0,
-        )
+        # The weights are read once per step and never revisited, so they are
+        # marked for early eviction: keeping them would only push out the
+        # activations and the cache, which are read again.
+        if EVEN_K:
+            w = tl.load(
+                w_ptr + offs_n[:, None] * K + offs_k[None, :],
+                mask=n_live[:, None],
+                other=0.0,
+                eviction_policy="evict_first",
+            )
+        else:
+            w = tl.load(
+                w_ptr + offs_n[:, None] * K + offs_k[None, :],
+                mask=n_live[:, None] & (offs_k[None, :] < K),
+                other=0.0,
+                eviction_policy="evict_first",
+            )
         acc += tl.dot(x, tl.trans(w))
 
     result = acc.to(o_ptr.dtype.element_ty)
@@ -242,6 +298,7 @@ def run(x, weight, out, config, residual=None, gain=None, eps=0.0) -> None:
         )
         _split_gemm[(triton.cdiv(n, block_n), split_k)](
             x, weight, partials, rows, n, k,
+            EVEN_K=k % block_k == 0,
             BLOCK_M=block_m_for(rows), BLOCK_N=block_n,
             BLOCK_K=block_k, SPLIT_K=split_k,
             num_warps=warps, num_stages=stages,
@@ -264,6 +321,7 @@ def run(x, weight, out, config, residual=None, gain=None, eps=0.0) -> None:
         rows, n, k, eps,
         HAS_RESIDUAL=residual is not None,
         NORMALIZE=gain is not None,
+        EVEN_K=k % block_k == 0,
         BLOCK_M=block_m_for(rows), BLOCK_N=block_n, BLOCK_K=block_k,
         num_warps=warps, num_stages=stages,
     )
