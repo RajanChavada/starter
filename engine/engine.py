@@ -22,7 +22,7 @@ from kernels.rmsnorm import rms_norm
 DEVICE = "cuda:0"
 
 #: Fold the residual add into the GEMM store, rather than its own launch.
-USE_RESIDUAL_EPILOGUE = False
+USE_RESIDUAL_EPILOGUE = True
 
 #: Activate gate/up inside the down projection rather than in its own launch.
 USE_SWIGLU_EPILOGUE = True
