@@ -14,7 +14,7 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM
 
-from kernels import elementwise, gemm, lm_head
+from kernels import elementwise, gemm
 from kernels.flash_decode import BLOCK_M, choose_splits, flash_decode
 from kernels.qkv import qkv_finish
 from kernels.rmsnorm import rms_norm
@@ -119,9 +119,6 @@ class Engine:
         self._fused_swiglu = False
         self._fused_qkv = False
         self._gemm_norm = False
-        self._lm_head_config = None
-        self._lm_head_values = None
-        self._lm_head_indices = None
         self._batch = 0
         self._capacity = 0
         self._graph = None
@@ -375,64 +372,6 @@ class Engine:
             if key not in self._gemm_plan:
                 self._gemm_plan[key] = self._choose_gemm(weight, batch)
 
-    def _plan_lm_head(self, batch: int) -> None:
-        """Adopt a fused LM-head argmax only when it earns its two kernels.
-
-        It uses the already-selected non-split decode GEMM tile, so it cannot
-        introduce a new shape-specific tuning decision.  This runs only in
-        warmup and any compiler/numerical failure leaves the established path
-        intact.
-        """
-        weight = self.model.lm_head.weight
-        config = self._gemm_plan.get(tuple(weight.shape))
-        if config is None or len(config) != 4:
-            return
-        try:
-            rows, columns = batch, weight.shape[1]
-            block_n = config[0]
-            tiles = (weight.shape[0] + block_n - 1) // block_n
-            values = torch.empty((rows, tiles), dtype=torch.float32, device=DEVICE)
-            indices = torch.empty((rows, tiles), dtype=torch.int32, device=DEVICE)
-            output = torch.empty((rows, 1), dtype=torch.int64, device=DEVICE)
-            x = torch.randn((rows, columns), dtype=torch.bfloat16, device=DEVICE)
-            norm = self.base.norm
-
-            reference = self._fast_linear(weight, x, norm=norm).argmax(
-                dim=-1, keepdim=True
-            )
-            lm_head.run(x, weight, norm.weight, norm.variance_epsilon, values, indices, output, config)
-            torch.cuda.synchronize()
-            if not torch.equal(output, reference):
-                _log("lm-head fused argmax disagreed, keeping projection")
-                return
-
-            baseline = _time_ms(
-                lambda: self._fast_linear(weight, x, norm=norm).argmax(
-                    dim=-1, keepdim=True
-                )
-            )
-            elapsed = _time_ms(
-                lambda: lm_head.run(
-                    x, weight, norm.weight, norm.variance_epsilon,
-                    values, indices, output, config,
-                )
-            )
-            if elapsed >= baseline:
-                _log(
-                    f"lm-head fused argmax lost {elapsed * 1000:.0f}us "
-                    f">= {baseline * 1000:.0f}us"
-                )
-                return
-            self._lm_head_config = config
-            self._lm_head_values = values
-            self._lm_head_indices = indices
-            _log(
-                f"lm-head fused argmax {baseline * 1000:.0f}us "
-                f"-> {elapsed * 1000:.0f}us"
-            )
-        except Exception as error:  # noqa: BLE001 - optional decode tail
-            _log(f"lm-head fused argmax unavailable: {type(error).__name__}")
-
     def _choose_gemm(self, weight, batch: int):
         rows, columns = weight.shape
         try:
@@ -534,10 +473,6 @@ class Engine:
 
         self._plan_gemms(batch)
         self._plan_fusions(batch)
-        self._lm_head_config = None
-        self._lm_head_values = None
-        self._lm_head_indices = None
-        self._plan_lm_head(batch)
 
         self.attn_out = torch.zeros(
             (batch, self.n_kv_heads, self.kv_groups, self.head_dim),
@@ -790,22 +725,11 @@ class Engine:
 
         for index, layer in enumerate(self.layers):
             hidden = self._layer_decode(layer, index, hidden, cos, sin, mask)
-        if self._lm_head_config is None:
-            logits = self._fast_linear(
-                self.model.lm_head.weight, hidden, norm=self.base.norm
-            )
-            self.next_token.copy_(logits[:, -1, :].argmax(dim=-1, keepdim=True))
-        else:
-            lm_head.run(
-                hidden.view(self._batch, -1),
-                self.model.lm_head.weight,
-                self.base.norm.weight,
-                self.base.norm.variance_epsilon,
-                self._lm_head_values,
-                self._lm_head_indices,
-                self.next_token,
-                self._lm_head_config,
-            )
+        logits = self._fast_linear(
+            self.model.lm_head.weight, hidden, norm=self.base.norm
+        )
+
+        self.next_token.copy_(logits[:, -1, :].argmax(dim=-1, keepdim=True))
         self.step_token.copy_(self.next_token)
         # Tokens accumulate on device so the host can collect a chunk of steps
         # with a single copy instead of stalling once per step.
