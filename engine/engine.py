@@ -44,6 +44,12 @@ USE_CUDA_GRAPH = True
 #: any lazy allocation happens outside the graph.
 CAPTURE_WARMUP_STEPS = 3
 
+#: The 19,456-wide gate/up projection is half of every layer's streamed
+#: weights.  A 256-wide tile yields just 76 blocks at batch 1, leaving H100
+#: SMs idle.  This 64-wide plan launches 304 blocks and is deliberately fixed
+#: so warmup jitter cannot select the under-filled variant for a whole run.
+PINNED_GATEUP_CONFIG = (64, 128, 4, 4)
+
 
 def _log(message: str) -> None:
     """Diagnostics for the run log's bounded tail.
@@ -377,6 +383,26 @@ class Engine:
         except Exception as error:  # noqa: BLE001
             _log(f"gemm plan skipped [{rows}x{columns}]: {type(error).__name__}")
             return None
+
+        if rows == 2 * self.mlp_size:
+            # This is the dominant projection.  Pin a tile count that fills
+            # H100 instead of letting microsecond-scale warmup noise choose a
+            # low-occupancy shape.  A compile or numerical miss falls through
+            # to the existing cuBLAS-vs-Triton planner.
+            try:
+                gemm.run(x, weight, out, PINNED_GATEUP_CONFIG)
+                torch.cuda.synchronize()
+                gap = (out.float() - reference.float()).abs().max().item()
+                if gap <= allowed and self._residual_agrees(
+                    PINNED_GATEUP_CONFIG, x, weight, out
+                ):
+                    _log(
+                        f"gemm [{rows}x{columns}] pinned={PINNED_GATEUP_CONFIG} "
+                        f"cublas={baseline * 1000:.0f}us"
+                    )
+                    return PINNED_GATEUP_CONFIG
+            except Exception as error:  # noqa: BLE001 - retain the planner
+                _log(f"gateup pin unavailable: {type(error).__name__}")
 
         candidates = gemm.CONFIGS
         if rows <= gemm.SPLIT_MAX_N:
