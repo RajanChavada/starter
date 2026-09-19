@@ -25,9 +25,6 @@ DEVICE = "cuda:0"
 #: but nothing requires one D2H copy per step, and the copy costs a stall.
 SYNC_CHUNK = 1024
 
-#: Relayout weights at load into the tile order the kernel streams.
-USE_SWIZZLED_WEIGHTS = True
-
 #: Tolerance for accepting a custom GEMM against cuBLAS. Both accumulate in
 #: fp32 and round once, so a correct kernel lands far inside this.
 GEMM_ATOL = 0.05
@@ -112,7 +109,6 @@ class Engine:
         self._fuse_projections()
 
         self._gemm_plan = {}
-        self._swizzled = {}
         self._fused_norm = False
         self._fused_rope = False
         self._fused_swiglu = False
@@ -347,7 +343,6 @@ class Engine:
             residual=None if residual is None else residual.reshape(rows, -1),
             gain=norm.weight if fused_norm else None,
             eps=norm.variance_epsilon if fused_norm else 0.0,
-            swizzled=self._swizzled.get(weight.data_ptr()),
         )
         return out.view(rows, 1, -1)
 
@@ -370,70 +365,6 @@ class Engine:
             key = tuple(weight.shape)
             if key not in self._gemm_plan:
                 self._gemm_plan[key] = self._choose_gemm(weight, batch)
-
-    @torch.no_grad()
-    def _plan_swizzle(self) -> None:
-        """Relayout every weight whose chosen tiling divides it evenly.
-
-        Streaming a weight as one contiguous block per program, rather than
-        BLOCK_N runs strided K apart, is what the memory system rewards. The
-        relayout happens once at load, which is untimed, and is checked
-        against the plain kernel before anything uses it.
-        """
-        self._swizzled = {}
-        if not USE_SWIZZLED_WEIGHTS:
-            return
-        weights = [self.model.lm_head.weight]
-        for layer in self.layers:
-            weights += [
-                layer.self_attn.qkv_weight,
-                layer.self_attn.o_proj.weight,
-                layer.mlp.gateup_weight,
-                layer.mlp.down_proj.weight,
-            ]
-        adopted = 0
-        for weight in weights:
-            config = self._gemm_plan.get(tuple(weight.shape))
-            if config is None:
-                continue
-            try:
-                tiled = gemm.swizzle(weight, config)
-            except Exception:  # noqa: BLE001
-                tiled = None
-            if tiled is None:
-                continue
-            self._swizzled[weight.data_ptr()] = tiled
-            adopted += 1
-        if self._swizzled and not self._check(self._try_swizzle):
-            self._swizzled = {}
-            adopted = 0
-        torch.cuda.empty_cache()
-        _log(
-            f"swizzled {adopted} weights, "
-            f"mem={torch.cuda.memory_allocated() / 2**30:.1f}GiB"
-        )
-
-    def _try_swizzle(self) -> bool:
-        for weight in (
-            self.layers[0].self_attn.qkv_weight,
-            self.layers[0].mlp.down_proj.weight,
-            self.model.lm_head.weight,
-        ):
-            tiled = self._swizzled.get(weight.data_ptr())
-            if tiled is None:
-                continue
-            config = self._gemm_plan[tuple(weight.shape)]
-            x = torch.randn(
-                (self._batch, weight.shape[1]), device=DEVICE, dtype=torch.bfloat16
-            )
-            out = torch.empty(
-                (self._batch, weight.shape[0]), device=DEVICE, dtype=torch.bfloat16
-            )
-            gemm.run(x, weight, out, config, swizzled=tiled)
-            torch.cuda.synchronize()
-            if not self._agrees(out, F.linear(x, weight)):
-                return False
-        return True
 
     def _choose_gemm(self, weight, batch: int):
         rows, columns = weight.shape
@@ -535,7 +466,6 @@ class Engine:
         )
 
         self._plan_gemms(batch)
-        self._plan_swizzle()
         self._plan_fusions(batch)
 
         self.attn_out = torch.zeros(
