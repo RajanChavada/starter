@@ -435,6 +435,7 @@ class Engine:
         """
         self._gemm_plan = {}
         first = self.layers[0]
+        self._verify_split_fixup(first.mlp.down_proj.weight, batch)
         for weight in (
             first.self_attn.qkv_weight,
             first.self_attn.o_proj.weight,
@@ -445,6 +446,38 @@ class Engine:
             key = tuple(weight.shape)
             if key not in self._gemm_plan:
                 self._gemm_plan[key] = self._choose_gemm(weight, batch)
+
+    def _verify_split_fixup(self, weight, batch: int) -> None:
+        """Exercise the single-launch split-K path against the two-launch one.
+
+        The fixup relies on cross-program ordering, which a single check
+        cannot prove, so it is replayed many times with fresh inputs; one
+        disagreement falls back to the separate reduction for the whole run.
+        """
+        if not gemm.SPLIT_FIXUP:
+            return
+        rows, columns = weight.shape
+        try:
+            x = torch.randn((batch, columns), device=DEVICE, dtype=torch.bfloat16)
+            residual = torch.randn((batch, rows), device=DEVICE, dtype=torch.bfloat16)
+            fused = torch.empty_like(residual)
+            plain = torch.empty_like(residual)
+            for trial in range(64):
+                x.normal_()
+                residual.normal_()
+                config = gemm.SPLIT_CONFIGS[trial % len(gemm.SPLIT_CONFIGS)]
+                gemm.SPLIT_FIXUP = True
+                gemm.run(x, weight, fused, config, residual=residual)
+                gemm.SPLIT_FIXUP = False
+                gemm.run(x, weight, plain, config, residual=residual)
+                gemm.SPLIT_FIXUP = True
+                torch.cuda.synchronize()
+                if not torch.equal(fused, plain):
+                    raise RuntimeError(f"mismatch on trial {trial} config {config}")
+            _log("split-k fixup verified bit-identical to the two-launch reduction")
+        except Exception as error:  # noqa: BLE001 - keep the proven path
+            gemm.SPLIT_FIXUP = False
+            _log(f"split-k fixup disabled: {type(error).__name__}: {error}")
 
     def _choose_gemm(self, weight, batch: int):
         rows, columns = weight.shape

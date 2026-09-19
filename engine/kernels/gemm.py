@@ -117,6 +117,101 @@ def _split_gemm(
 
 
 @triton.jit
+def _split_gemm_fixup(
+    x_ptr,
+    w_ptr,
+    r_ptr,
+    part_ptr,
+    lock_ptr,
+    o_ptr,
+    M,
+    N,
+    K,
+    HAS_RESIDUAL: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+):
+    """Split-K with the reduction folded into the last program to finish.
+
+    Every program stores its fp32 partial, then increments the tile's counter
+    with release semantics. The program that observes the final count reads
+    all SPLIT_K partials back, in split order, and runs the epilogue, so the
+    sum is the same in-order fp32 sum ``_reduce_splits`` performs and the
+    second launch disappears. The counter is reset for the next replay.
+    """
+    pid_n = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_m = tl.arange(0, BLOCK_M)
+    n_live = offs_n < N
+    m_live = offs_m < M
+    tile_mask = m_live[:, None] & n_live[None, :]
+    tile_offs = offs_m[:, None] * N + offs_n[None, :]
+
+    per_split = tl.cdiv(K, SPLIT_K)
+    start = pid_k * per_split
+    stop = tl.minimum(start + per_split, K)
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
+    for k0 in range(start, stop, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)
+        k_live = offs_k < stop
+        x = tl.load(
+            x_ptr + offs_m[:, None] * K + offs_k[None, :],
+            mask=m_live[:, None] & k_live[None, :],
+            other=0.0,
+        )
+        w = tl.load(
+            w_ptr + offs_n[:, None] * K + offs_k[None, :],
+            mask=n_live[:, None] & k_live[None, :],
+            other=0.0,
+        )
+        acc += tl.dot(x, tl.trans(w))
+
+    tl.store(part_ptr + pid_k * (M * N) + tile_offs, acc, mask=tile_mask)
+    tl.debug_barrier()
+    arrived = tl.atomic_add(lock_ptr + pid_n, 1, sem="acq_rel", scope="gpu")
+    tl.debug_barrier()
+
+    if arrived == SPLIT_K - 1:
+        total = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
+        for split in range(SPLIT_K):
+            total += tl.load(
+                part_ptr + split * (M * N) + tile_offs,
+                mask=tile_mask,
+                other=0.0,
+                volatile=True,
+            )
+        result = total.to(o_ptr.dtype.element_ty)
+        if HAS_RESIDUAL:
+            residual = tl.load(r_ptr + tile_offs, mask=tile_mask, other=0.0)
+            result = (result.to(tl.float32) + residual.to(tl.float32)).to(
+                o_ptr.dtype.element_ty
+            )
+        tl.store(o_ptr + tile_offs, result, mask=tile_mask)
+        tl.debug_barrier()
+        tl.atomic_xchg(lock_ptr + pid_n, 0, sem="release", scope="gpu")
+
+
+#: Set False to fall back to the separate reduction launch.
+SPLIT_FIXUP = True
+
+_locks = {}
+
+
+def _lock_buffer(device) -> torch.Tensor:
+    """Per-tile arrival counters, zero at rest; each launch leaves them zero."""
+    key = str(device)
+    locks = _locks.get(key)
+    if locks is None:
+        locks = torch.zeros(4096, dtype=torch.int32, device=device)
+        _locks[key] = locks
+    return locks
+
+
+@triton.jit
 def _reduce_splits(
     part_ptr,
     r_ptr,
@@ -347,6 +442,16 @@ def run(x, weight, out, config, residual=None, gain=None, eps=0.0) -> None:
         partials = torch.empty(
             (split_k, rows, n), dtype=torch.float32, device=x.device
         )
+        if SPLIT_FIXUP:
+            _split_gemm_fixup[(triton.cdiv(n, block_n), split_k)](
+                x, weight, residual if residual is not None else out,
+                partials, _lock_buffer(x.device), out, rows, n, k,
+                HAS_RESIDUAL=residual is not None,
+                BLOCK_M=block_m_for(rows), BLOCK_N=block_n,
+                BLOCK_K=block_k, SPLIT_K=split_k,
+                num_warps=warps, num_stages=stages,
+            )
+            return
         _split_gemm[(triton.cdiv(n, block_n), split_k)](
             x, weight, partials, rows, n, k,
             BLOCK_M=block_m_for(rows), BLOCK_N=block_n,
