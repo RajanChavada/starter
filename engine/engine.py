@@ -378,8 +378,13 @@ class Engine:
             _log(f"gemm plan skipped [{rows}x{columns}]: {type(error).__name__}")
             return None
 
+        candidates = gemm.CONFIGS
+        if rows <= gemm.SPLIT_MAX_N:
+            # Narrow outputs cannot fill the device by tiling N alone.
+            candidates = candidates + gemm.SPLIT_CONFIGS
+
         best, best_ms = None, baseline
-        for config in gemm.CONFIGS:
+        for config in candidates:
             try:
                 gemm.run(x, weight, out, config)
                 torch.cuda.synchronize()

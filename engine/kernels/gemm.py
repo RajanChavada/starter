@@ -46,6 +46,100 @@ CONFIGS = (
     (256, 64, 8, 3),
 )
 
+#: (BLOCK_N, BLOCK_K, num_warps, num_stages, SPLIT_K), offered only for the
+#: narrow-output projections. o_proj and down_proj both emit 2560, so tiling
+#: the output alone yields ~80 programs for 132 SMs -- the device is more than
+#: a third idle while streaming a third of each layer's weights. Splitting the
+#: reduction instead multiplies the program count by SPLIT_K.
+#:
+#: The partial sums stay in fp32 and are reduced in a second pass rather than
+#: accumulated with atomics, so the result does not depend on the order blocks
+#: happen to finish in. It is the same fp32 reduction the single-pass kernel
+#: does, reassociated.
+SPLIT_CONFIGS = (
+    (16, 128, 4, 3, 4),
+    (16, 256, 4, 3, 8),
+    (32, 64, 4, 4, 8),
+    (32, 128, 4, 3, 4),
+    (64, 64, 4, 3, 4),
+)
+
+#: Above this output width there are already enough programs and the partial
+#: buffer would be large for no benefit.
+SPLIT_MAX_N = 4096
+
+
+@triton.jit
+def _split_gemm(
+    x_ptr,
+    w_ptr,
+    part_ptr,
+    M,
+    N,
+    K,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+):
+    pid_n = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_m = tl.arange(0, BLOCK_M)
+    n_live = offs_n < N
+    m_live = offs_m < M
+
+    per_split = tl.cdiv(K, SPLIT_K)
+    start = pid_k * per_split
+    stop = tl.minimum(start + per_split, K)
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
+    for k0 in range(start, stop, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)
+        k_live = offs_k < stop
+        x = tl.load(
+            x_ptr + offs_m[:, None] * K + offs_k[None, :],
+            mask=m_live[:, None] & k_live[None, :],
+            other=0.0,
+        )
+        w = tl.load(
+            w_ptr + offs_n[:, None] * K + offs_k[None, :],
+            mask=n_live[:, None] & k_live[None, :],
+            other=0.0,
+        )
+        acc += tl.dot(x, tl.trans(w))
+
+    tl.store(
+        part_ptr + pid_k * (M * N) + offs_m[:, None] * N + offs_n[None, :],
+        acc,
+        mask=m_live[:, None] & n_live[None, :],
+    )
+
+
+@triton.jit
+def _reduce_splits(
+    part_ptr,
+    r_ptr,
+    o_ptr,
+    TOTAL,
+    HAS_RESIDUAL: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    live = offs < TOTAL
+    total = tl.zeros((BLOCK,), tl.float32)
+    for split in range(SPLIT_K):
+        total += tl.load(part_ptr + split * TOTAL + offs, mask=live, other=0.0)
+
+    result = total.to(o_ptr.dtype.element_ty)
+    if HAS_RESIDUAL:
+        residual = tl.load(r_ptr + offs, mask=live, other=0.0)
+        result = (result.to(tl.float32) + residual.to(tl.float32)).to(
+            o_ptr.dtype.element_ty
+        )
+    tl.store(o_ptr + offs, result, mask=live)
+
 
 @triton.jit
 def _skinny_gemm(
@@ -138,9 +232,29 @@ def run(x, weight, out, config, residual=None, gain=None, eps=0.0) -> None:
     ``gain``, if given, is the [K] RMSNorm weight applied to ``x`` before the
     product, folding the pre-matmul norm in the same way.
     """
-    block_n, block_k, warps, stages = config
     rows, k = x.shape
     n = weight.shape[0]
+
+    if len(config) == 5:
+        block_n, block_k, warps, stages, split_k = config
+        partials = torch.empty(
+            (split_k, rows, n), dtype=torch.float32, device=x.device
+        )
+        _split_gemm[(triton.cdiv(n, block_n), split_k)](
+            x, weight, partials, rows, n, k,
+            BLOCK_M=block_m_for(rows), BLOCK_N=block_n,
+            BLOCK_K=block_k, SPLIT_K=split_k,
+            num_warps=warps, num_stages=stages,
+        )
+        total = rows * n
+        _reduce_splits[(triton.cdiv(total, 1024),)](
+            partials, residual if residual is not None else out, out, total,
+            HAS_RESIDUAL=residual is not None, SPLIT_K=split_k, BLOCK=1024,
+            num_warps=4, num_stages=2,
+        )
+        return
+
+    block_n, block_k, warps, stages = config
     _skinny_gemm[(triton.cdiv(n, block_n),)](
         x,
         weight,
