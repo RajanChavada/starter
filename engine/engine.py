@@ -44,6 +44,11 @@ USE_CUDA_GRAPH = True
 #: any lazy allocation happens outside the graph.
 CAPTURE_WARMUP_STEPS = 3
 
+#: Decode steps captured into one replay. The first token is still yielded
+#: immediately after prefill; this only reduces host graph replay overhead for
+#: the remaining stream.
+DECODE_GRAPH_STEPS = 8
+
 
 def _log(message: str) -> None:
     """Diagnostics for the run log's bounded tail.
@@ -117,6 +122,7 @@ class Engine:
         self._batch = 0
         self._capacity = 0
         self._graph = None
+        self._block_graph = None
         self._graph_shape = None
         self._warmed = False
         self.k_cache = []
@@ -476,6 +482,7 @@ class Engine:
         self._plan_attention()
 
         self._graph = None
+        self._block_graph = None
         self._graph_shape = None
 
     def _attention_buffers(self, splits: int):
@@ -753,7 +760,16 @@ class Engine:
         with torch.cuda.graph(graph):
             self._decode_step()
 
+        self.cur_pos.zero_()
+        self.step_token.zero_()
+        self.step_idx.zero_()
+        block_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(block_graph):
+            for _ in range(DECODE_GRAPH_STEPS):
+                self._decode_step()
+
         self._graph = graph
+        self._block_graph = block_graph
         self._graph_shape = (self._batch, self._capacity)
         for keys, values in zip(self.k_cache, self.v_cache):
             keys.zero_()
@@ -793,6 +809,7 @@ class Engine:
             except Exception as error:  # noqa: BLE001 - eager still produces tokens
                 _log(f"capture failed, decoding eagerly: {type(error).__name__}: {error}")
                 self._graph = None
+                self._block_graph = None
                 self._graph_shape = None
                 for keys, values in zip(self.k_cache, self.v_cache):
                     keys.zero_()
@@ -815,10 +832,14 @@ class Engine:
             delivered = 1
             while delivered < max_new_tokens:
                 chunk = min(SYNC_CHUNK, max_new_tokens - delivered)
-                for _ in range(chunk):
-                    if use_graph:
+                if use_graph:
+                    blocks, tail = divmod(chunk, DECODE_GRAPH_STEPS)
+                    for _ in range(blocks):
+                        self._block_graph.replay()
+                    for _ in range(tail):
                         self._graph.replay()
-                    else:
+                else:
+                    for _ in range(chunk):
                         self._decode_step()
                 # One device sync for the whole chunk, then replay it to the
                 # harness a step at a time. The tokens are bit-identical; only

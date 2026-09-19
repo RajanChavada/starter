@@ -270,6 +270,8 @@ so it is the verification step — no local or rented GPU required.
 | replay-timed warmup autotune | 59425ba | 193.5 | 400.6 | 2207.9 | 742.2 | regression |
 | aligned / evict-first GEMM loads | 8d22ca8 | | | | pending | queued |
 | eight-step decode graph replay | pending | | | | pending | submitting next |
+| restore best split-K tree | 3958c4a | | | | pending | queued |
+| eight-step graph on split-K tree | pending | | | | pending | submitting next |
 
 ## Commit -> score ladder (p0 tpot is the number to drive down)
 
@@ -286,6 +288,7 @@ so it is the verification step — no local or rented GPU required.
 | 1444d26 | restore of 4f7c38f tree | pending | | |
 | 59425ba | replay-timed warmup autotune | 742.2 | | reverted/regression |
 | 8d22ca8 | aligned / evict-first GEMM loads | pending | | queued |
+| 3958c4a | restore best split-K tree | pending | | queued |
 
 | 1444d26 | restore of 4f7c38f tree | **failed** | 4.66 | `unstable_timing` |
 
