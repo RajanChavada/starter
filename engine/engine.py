@@ -14,7 +14,16 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM
 
+from kernels.flash_decode import BLOCK_M, choose_splits, flash_decode
+
 DEVICE = "cuda:0"
+
+#: Key block for the decode kernel's inner loop.
+DECODE_BLOCK_N = 64
+
+#: The challenge spec's own tolerance, reused to gate the custom kernel.
+CHECK_ATOL = 0.02
+CHECK_RTOL = 0.02
 
 #: One-line kill switch if a captured graph turns out to be what breaks a run.
 USE_CUDA_GRAPH = True
@@ -66,6 +75,8 @@ class Engine:
         self.kv_groups = config.num_attention_heads // self.n_kv_heads
         self.scaling = self.head_dim**-0.5
 
+        self._fuse_projections()
+
         self._batch = 0
         self._capacity = 0
         self._graph = None
@@ -80,6 +91,49 @@ class Engine:
         )
 
     # ---------------------------------------------------------------- setup
+
+    @torch.no_grad()
+    def _fuse_projections(self) -> None:
+        """Concatenate q/k/v and gate/up into single weights.
+
+        Decode is bound by streaming 8 GB of weights per step, and a matmul
+        with one row reaches only a fraction of peak bandwidth, so the seven
+        projections per layer become four larger ones. Each output element is
+        still the same dot product over the same inputs; only the tiling
+        cuBLAS chooses differs, which is a reordering.
+
+        Originals are dropped so the fused copies do not double weight memory.
+        """
+        attn = self.layers[0].self_attn
+        self.q_size = attn.q_proj.weight.shape[0]
+        self.kv_size = attn.k_proj.weight.shape[0]
+        self.mlp_size = self.layers[0].mlp.gate_proj.weight.shape[0]
+
+        for layer in self.layers:
+            attn = layer.self_attn
+            attn.qkv_weight = torch.cat(
+                [attn.q_proj.weight, attn.k_proj.weight, attn.v_proj.weight], dim=0
+            )
+            del attn.q_proj, attn.k_proj, attn.v_proj
+
+            mlp = layer.mlp
+            mlp.gateup_weight = torch.cat(
+                [mlp.gate_proj.weight, mlp.up_proj.weight], dim=0
+            )
+            del mlp.gate_proj, mlp.up_proj
+
+        torch.cuda.empty_cache()
+        _log(
+            f"fused projections qkv={self.q_size + 2 * self.kv_size} "
+            f"gateup={2 * self.mlp_size} "
+            f"weights={torch.cuda.memory_allocated() / 2**30:.2f}GiB"
+        )
+
+    def _mlp(self, layer, hidden):
+        gate_up = F.linear(hidden, layer.mlp.gateup_weight)
+        gate = gate_up[..., : self.mlp_size]
+        up = gate_up[..., self.mlp_size :]
+        return layer.mlp.down_proj(F.silu(gate) * up)
 
     def _build_rope_tables(self, capacity: int) -> None:
         """Tabulate per-position cos/sin.
@@ -118,10 +172,69 @@ class Engine:
         self.slots = torch.arange(capacity, device=DEVICE, dtype=torch.int64)
         # Fixed addresses the captured graph reads from and writes to.
         self.cur_pos = torch.zeros(1, dtype=torch.int64, device=DEVICE)
+        self.valid_len = torch.zeros(1, dtype=torch.int64, device=DEVICE)
         self.step_token = torch.zeros((batch, 1), dtype=torch.int64, device=DEVICE)
         self.next_token = torch.zeros((batch, 1), dtype=torch.int64, device=DEVICE)
+
+        heads = batch * self.n_kv_heads
+        self.splits = choose_splits(heads, capacity, DECODE_BLOCK_N)
+        self.attn_out = torch.zeros(
+            (batch, self.n_kv_heads, self.kv_groups, self.head_dim),
+            dtype=torch.bfloat16,
+            device=DEVICE,
+        )
+        self.acc_buf = torch.zeros(
+            (heads, self.splits, BLOCK_M, self.head_dim),
+            dtype=torch.float32,
+            device=DEVICE,
+        )
+        self.max_buf = torch.zeros(
+            (heads, self.splits, BLOCK_M), dtype=torch.float32, device=DEVICE
+        )
+        self.sum_buf = torch.zeros_like(self.max_buf)
+
+        self.use_triton_attn = self._validate_attention()
+        _log(
+            f"decode attention: {'triton' if self.use_triton_attn else 'sdpa'} "
+            f"splits={self.splits} block_n={DECODE_BLOCK_N}"
+        )
+
         self._graph = None
         self._graph_shape = None
+
+    def _validate_attention(self) -> bool:
+        """Check the custom kernel against SDPA before trusting it.
+
+        Warmup is untimed, so this is free. A kernel that disagrees costs us
+        speed by falling back; one that silently disagreed would cost the run.
+        """
+        batch, capacity = self._batch, self._capacity
+        generator = torch.Generator(device=DEVICE).manual_seed(0)
+        shape = (batch, self.n_kv_heads, self.kv_groups, self.head_dim)
+        cache_shape = (batch, self.n_kv_heads, capacity, self.head_dim)
+        query = torch.randn(shape, generator=generator, device=DEVICE, dtype=torch.bfloat16)
+        keys = torch.randn(cache_shape, generator=generator, device=DEVICE, dtype=torch.bfloat16)
+        values = torch.randn(cache_shape, generator=generator, device=DEVICE, dtype=torch.bfloat16)
+        probe = torch.empty_like(query)
+
+        lengths = {1, min(BLOCK_M + 1, capacity), max(1, capacity // 2), capacity}
+        for valid in sorted(lengths):
+            length = torch.tensor([valid], dtype=torch.int64, device=DEVICE)
+            flash_decode(
+                query, keys, values, length, probe,
+                self.acc_buf, self.max_buf, self.sum_buf,
+                self.scaling, self.splits, DECODE_BLOCK_N,
+            )
+            mask = (self.slots < valid).view(1, 1, 1, capacity)
+            reference = F.scaled_dot_product_attention(
+                query, keys, values, attn_mask=mask, scale=self.scaling
+            )
+            gap = (probe.float() - reference.float()).abs().max().item()
+            allowed = CHECK_ATOL + CHECK_RTOL * reference.float().abs().max().item()
+            if not gap <= allowed:
+                _log(f"kernel check FAILED at valid={valid}: {gap:.5f} > {allowed:.5f}")
+                return False
+        return True
 
     # -------------------------------------------------------------- prefill
 
@@ -132,9 +245,14 @@ class Engine:
         batch, length, _ = normed.shape
         head_shape = (batch, length, -1, self.head_dim)
 
-        query = attn.q_norm(attn.q_proj(normed).view(head_shape)).transpose(1, 2)
-        key = attn.k_norm(attn.k_proj(normed).view(head_shape)).transpose(1, 2)
-        value = attn.v_proj(normed).view(head_shape).transpose(1, 2)
+        # Slicing the fused output splits a stride-1 trailing dimension, so
+        # these reshapes are views and cost nothing.
+        qkv = F.linear(normed, attn.qkv_weight)
+        q_end = self.q_size
+        k_end = q_end + self.kv_size
+        query = attn.q_norm(qkv[..., :q_end].reshape(head_shape)).transpose(1, 2)
+        key = attn.k_norm(qkv[..., q_end:k_end].reshape(head_shape)).transpose(1, 2)
+        value = qkv[..., k_end:].reshape(head_shape).transpose(1, 2)
         query = (query * cos) + (_rotate_half(query) * sin)
         key = (key * cos) + (_rotate_half(key) * sin)
 
@@ -147,7 +265,7 @@ class Engine:
         )
         attended = attended.transpose(1, 2).reshape(batch, length, -1)
         hidden = residual + attn.o_proj(attended)
-        return hidden + layer.mlp(layer.post_attention_layernorm(hidden))
+        return hidden + self._mlp(layer, layer.post_attention_layernorm(hidden))
 
     @torch.inference_mode()
     def _prefill(self, ids: torch.Tensor) -> torch.Tensor:
@@ -180,13 +298,16 @@ class Engine:
         normed = layer.input_layernorm(hidden)
         batch = normed.shape[0]
 
+        qkv = F.linear(normed, attn.qkv_weight)
+        q_end = self.q_size
+        k_end = q_end + self.kv_size
         query = attn.q_norm(
-            attn.q_proj(normed).view(batch, 1, -1, self.head_dim)
+            qkv[..., :q_end].reshape(batch, 1, -1, self.head_dim)
         ).view(batch, self.n_kv_heads, self.kv_groups, self.head_dim)
         key = attn.k_norm(
-            attn.k_proj(normed).view(batch, 1, -1, self.head_dim)
+            qkv[..., q_end:k_end].reshape(batch, 1, -1, self.head_dim)
         ).view(batch, self.n_kv_heads, 1, self.head_dim)
-        value = attn.v_proj(normed).view(batch, self.n_kv_heads, 1, self.head_dim)
+        value = qkv[..., k_end:].reshape(batch, self.n_kv_heads, 1, self.head_dim)
 
         query = (query * cos) + (_rotate_half(query) * sin)
         key = (key * cos) + (_rotate_half(key) * sin)
@@ -195,13 +316,21 @@ class Engine:
         keys.index_copy_(2, self.cur_pos, key)
         values.index_copy_(2, self.cur_pos, value)
 
-        attended = F.scaled_dot_product_attention(
-            query, keys, values, attn_mask=mask, scale=self.scaling
-        )
+        if self.use_triton_attn:
+            flash_decode(
+                query, keys, values, self.valid_len, self.attn_out,
+                self.acc_buf, self.max_buf, self.sum_buf,
+                self.scaling, self.splits, DECODE_BLOCK_N,
+            )
+            attended = self.attn_out
+        else:
+            attended = F.scaled_dot_product_attention(
+                query, keys, values, attn_mask=mask, scale=self.scaling
+            )
         # Group-major flatten restores head order 0..31 for o_proj.
         attended = attended.reshape(batch, 1, -1)
         hidden = residual + attn.o_proj(attended)
-        return hidden + layer.mlp(layer.post_attention_layernorm(hidden))
+        return hidden + self._mlp(layer, layer.post_attention_layernorm(hidden))
 
     @torch.inference_mode()
     def _decode_step(self) -> None:
@@ -213,9 +342,14 @@ class Engine:
         hidden = self.base.embed_tokens(self.step_token)
         cos = self.cos_table.index_select(0, self.cur_pos).view(1, 1, 1, self.head_dim)
         sin = self.sin_table.index_select(0, self.cur_pos).view(1, 1, 1, self.head_dim)
-        # The slot just written is valid, so the bound is inclusive; capacity
-        # past it holds stale values and must stay masked.
-        mask = (self.slots <= self.cur_pos).view(1, 1, 1, self._capacity)
+        # The slot about to be written is live, so the count is cur_pos + 1.
+        # Capacity past it holds stale values and must never be read.
+        torch.add(self.cur_pos, 1, out=self.valid_len)
+        mask = (
+            None
+            if self.use_triton_attn
+            else (self.slots <= self.cur_pos).view(1, 1, 1, self._capacity)
+        )
 
         for index, layer in enumerate(self.layers):
             hidden = self._layer_decode(layer, index, hidden, cos, sin, mask)
