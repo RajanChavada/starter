@@ -113,6 +113,7 @@ class Engine:
         self._fused_rope = False
         self._fused_swiglu = False
         self._fused_qkv = False
+        self._gemm_norm = False
         self._batch = 0
         self._capacity = 0
         self._graph = None
@@ -164,9 +165,14 @@ class Engine:
             f"weights={torch.cuda.memory_allocated() / 2**30:.2f}GiB"
         )
 
-    def _mlp(self, layer, hidden, fast: bool = False, residual=None):
+    def _mlp(self, layer, hidden, fast: bool = False, residual=None, norm=None):
         linear = self._fast_linear if fast else _torch_linear
-        gate_up = linear(layer.mlp.gateup_weight, hidden)
+        if fast:
+            gate_up = self._fast_linear(layer.mlp.gateup_weight, hidden, norm=norm)
+        else:
+            if norm is not None:
+                hidden = self._norm(norm, hidden)
+            gate_up = linear(layer.mlp.gateup_weight, hidden)
         if self._fused_swiglu:
             activated = elementwise.swiglu(gate_up)
         else:
@@ -202,10 +208,40 @@ class Engine:
         self._fused_rope = self._check(lambda: self._try_rope(batch))
         self._fused_swiglu = self._check(lambda: self._try_swiglu(batch))
         self._fused_qkv = self._check(lambda: self._try_qkv(batch))
+        self._gemm_norm = self._check(lambda: self._try_gemm_norm(batch))
         _log(
             f"fusions norm={self._fused_norm} rope={self._fused_rope} "
-            f"swiglu={self._fused_swiglu} qkv={self._fused_qkv}"
+            f"swiglu={self._fused_swiglu} qkv={self._fused_qkv} "
+            f"gemm_norm={self._gemm_norm}"
         )
+
+    def _try_gemm_norm(self, batch: int) -> bool:
+        """Check the GEMM's fused RMSNorm against norm-then-matmul.
+
+        Checked on both shapes that use it: the 2560-wide hidden state into
+        the QKV weight, and the same into gate/up.
+        """
+        for weight, norm in (
+            (self.layers[0].self_attn.qkv_weight, self.layers[0].input_layernorm),
+            (self.layers[0].mlp.gateup_weight, self.layers[0].post_attention_layernorm),
+        ):
+            config = self._gemm_plan.get(tuple(weight.shape))
+            if config is None:
+                return False
+            x = torch.randn(
+                (batch, weight.shape[1]), device=DEVICE, dtype=torch.bfloat16
+            )
+            out = torch.empty(
+                (batch, weight.shape[0]), device=DEVICE, dtype=torch.bfloat16
+            )
+            gemm.run(
+                x, weight, out, config,
+                gain=norm.weight, eps=norm.variance_epsilon,
+            )
+            torch.cuda.synchronize()
+            if not self._agrees(out, F.linear(norm(x), weight)):
+                return False
+        return True
 
     def _try_qkv(self, batch: int) -> bool:
         attn = self.layers[0].self_attn
@@ -283,13 +319,17 @@ class Engine:
 
     # ------------------------------------------------------------ projections
 
-    def _fast_linear(self, weight, x, residual=None):
+    def _fast_linear(self, weight, x, residual=None, norm=None):
         """Decode-path matmul, using whichever of cuBLAS or Triton won at warmup.
 
-        ``residual`` is folded into the kernel's epilogue when the custom path
-        is active, removing one launch per residual branch per layer.
+        ``residual`` and ``norm`` are folded into the kernel when the custom
+        path is active, removing one launch each per layer. Either falls back
+        to its own launch if the fused form was not adopted at warmup.
         """
         config = self._gemm_plan.get(tuple(weight.shape))
+        fused_norm = norm is not None and config is not None and self._gemm_norm
+        if norm is not None and not fused_norm:
+            x = self._norm(norm, x)
         if config is None:
             out = F.linear(x, weight)
             return out if residual is None else residual + out
@@ -301,6 +341,8 @@ class Engine:
             out,
             config,
             residual=None if residual is None else residual.reshape(rows, -1),
+            gain=norm.weight if fused_norm else None,
+            eps=norm.variance_epsilon if fused_norm else 0.0,
         )
         return out.view(rows, 1, -1)
 
@@ -407,6 +449,7 @@ class Engine:
         ]
 
         self.slots = torch.arange(capacity, device=DEVICE, dtype=torch.int64)
+        self._full_len = torch.tensor([capacity], dtype=torch.int64, device=DEVICE)
         # Fixed addresses the captured graph reads from and writes to.
         self.cur_pos = torch.zeros(1, dtype=torch.int64, device=DEVICE)
         self.valid_len = torch.zeros(1, dtype=torch.int64, device=DEVICE)
@@ -420,72 +463,104 @@ class Engine:
         self._plan_gemms(batch)
         self._plan_fusions(batch)
 
-        heads = batch * self.n_kv_heads
-        self.splits = choose_splits(heads, capacity, DECODE_BLOCK_N)
         self.attn_out = torch.zeros(
             (batch, self.n_kv_heads, self.kv_groups, self.head_dim),
             dtype=torch.bfloat16,
             device=DEVICE,
         )
-        self.acc_buf = torch.zeros(
-            (heads, self.splits, BLOCK_M, self.head_dim),
-            dtype=torch.float32,
-            device=DEVICE,
-        )
-        self.max_buf = torch.zeros(
-            (heads, self.splits, BLOCK_M), dtype=torch.float32, device=DEVICE
-        )
-        self.sum_buf = torch.zeros_like(self.max_buf)
-
-        self.use_triton_attn = self._validate_attention()
-        _log(
-            f"decode attention: {'triton' if self.use_triton_attn else 'sdpa'} "
-            f"splits={self.splits} block_n={DECODE_BLOCK_N}"
-        )
+        self._plan_attention()
 
         self._graph = None
         self._graph_shape = None
 
-    def _validate_attention(self) -> bool:
-        """Check the custom kernel against SDPA before trusting it.
+    def _attention_buffers(self, splits: int):
+        heads = self._batch * self.n_kv_heads
+        acc = torch.zeros(
+            (heads, splits, BLOCK_M, self.head_dim),
+            dtype=torch.float32,
+            device=DEVICE,
+        )
+        stats = torch.zeros((heads, splits, BLOCK_M), dtype=torch.float32, device=DEVICE)
+        return acc, stats, torch.zeros_like(stats)
 
-        Warmup is untimed, so this is free. Any disagreement, and any
-        exception at all — a Triton compile failure, a bad launch grid, an
-        unsupported construct in this Triton build — falls back to the SDPA
-        path. A broken kernel then costs throughput instead of the run.
+    def _plan_attention(self) -> None:
+        """Pick the faster of SDPA and the split-K kernel, and its tiling.
+
+        Same discipline as the GEMM plan: the custom kernel has to earn its
+        place against the reference on this workload's actual shapes, so a
+        kernel that is correct but slow is simply not used.
         """
-        try:
-            return self._compare_attention()
-        except Exception as error:  # noqa: BLE001 - fall back on anything
-            _log(f"kernel unusable, falling back to sdpa: {type(error).__name__}: {error}")
-            return False
-
-    def _compare_attention(self) -> bool:
         batch, capacity = self._batch, self._capacity
-        generator = torch.Generator(device=DEVICE).manual_seed(0)
-        shape = (batch, self.n_kv_heads, self.kv_groups, self.head_dim)
-        cache_shape = (batch, self.n_kv_heads, capacity, self.head_dim)
-        query = torch.randn(shape, generator=generator, device=DEVICE, dtype=torch.bfloat16)
-        keys = torch.randn(cache_shape, generator=generator, device=DEVICE, dtype=torch.bfloat16)
-        values = torch.randn(cache_shape, generator=generator, device=DEVICE, dtype=torch.bfloat16)
-        probe = torch.empty_like(query)
+        heads = batch * self.n_kv_heads
+        self.splits, self.block_n = choose_splits(heads, capacity, DECODE_BLOCK_N), DECODE_BLOCK_N
+        self.acc_buf, self.max_buf, self.sum_buf = self._attention_buffers(self.splits)
+        self.use_triton_attn = False
 
-        lengths = {1, min(BLOCK_M + 1, capacity), max(1, capacity // 2), capacity}
-        for valid in sorted(lengths):
+        try:
+            shape = (batch, self.n_kv_heads, self.kv_groups, self.head_dim)
+            cache_shape = (batch, self.n_kv_heads, capacity, self.head_dim)
+            generator = torch.Generator(device=DEVICE).manual_seed(0)
+            query = torch.randn(shape, generator=generator, device=DEVICE, dtype=torch.bfloat16)
+            keys = torch.randn(cache_shape, generator=generator, device=DEVICE, dtype=torch.bfloat16)
+            values = torch.randn(cache_shape, generator=generator, device=DEVICE, dtype=torch.bfloat16)
+            probe = torch.empty_like(query)
+            mask = (self.slots < capacity).view(1, 1, 1, capacity)
+            baseline = _time_ms(
+                lambda: F.scaled_dot_product_attention(
+                    query, keys, values, attn_mask=mask, scale=self.scaling
+                )
+            )
+        except Exception as error:  # noqa: BLE001
+            _log(f"attention plan skipped: {type(error).__name__}: {error}")
+            return
+
+        best, best_ms = None, baseline
+        seen = set()
+        for block_n in (32, 64, 128):
+            ceiling = choose_splits(heads, capacity, block_n)
+            for splits in {ceiling, max(1, ceiling // 2), max(1, ceiling // 4)}:
+                if (block_n, splits) in seen:
+                    continue
+                seen.add((block_n, splits))
+                try:
+                    buffers = self._attention_buffers(splits)
+                    if not self._attention_agrees(
+                        query, keys, values, probe, buffers, splits, block_n
+                    ):
+                        continue
+                    elapsed = _time_ms(
+                        lambda: flash_decode(
+                            query, keys, values, self._full_len, probe,
+                            *buffers, self.scaling, splits, block_n,
+                        )
+                    )
+                except Exception:  # noqa: BLE001
+                    continue
+                if elapsed < best_ms:
+                    best, best_ms = (splits, block_n), elapsed
+
+        if best is not None:
+            self.splits, self.block_n = best
+            self.acc_buf, self.max_buf, self.sum_buf = self._attention_buffers(self.splits)
+            self.use_triton_attn = True
+        _log(
+            f"attention sdpa={baseline * 1000:.0f}us chosen="
+            f"{'triton ' + str(best) if best else 'sdpa'} at {best_ms * 1000:.0f}us"
+        )
+
+    def _attention_agrees(self, query, keys, values, probe, buffers, splits, block_n) -> bool:
+        capacity = self._capacity
+        for valid in sorted({1, min(BLOCK_M + 1, capacity), max(1, capacity // 2), capacity}):
             length = torch.tensor([valid], dtype=torch.int64, device=DEVICE)
             flash_decode(
-                query, keys, values, length, probe,
-                self.acc_buf, self.max_buf, self.sum_buf,
-                self.scaling, self.splits, DECODE_BLOCK_N,
+                query, keys, values, length, probe, *buffers,
+                self.scaling, splits, block_n,
             )
             mask = (self.slots < valid).view(1, 1, 1, capacity)
             reference = F.scaled_dot_product_attention(
                 query, keys, values, attn_mask=mask, scale=self.scaling
             )
-            gap = (probe.float() - reference.float()).abs().max().item()
-            allowed = CHECK_ATOL + CHECK_RTOL * reference.float().abs().max().item()
-            if not gap <= allowed:
-                _log(f"kernel check FAILED at valid={valid}: {gap:.5f} > {allowed:.5f}")
+            if not self._agrees(probe, reference):
                 return False
         return True
 
@@ -519,7 +594,7 @@ class Engine:
         attended = attended.transpose(1, 2).reshape(batch, length, -1)
         hidden = residual + attn.o_proj(attended)
         return hidden + self._mlp(
-            layer, self._norm(layer.post_attention_layernorm, hidden)
+            layer, hidden, norm=layer.post_attention_layernorm
         )
 
     @torch.inference_mode()
@@ -550,10 +625,11 @@ class Engine:
         """
         attn = layer.self_attn
         residual = hidden
-        normed = self._norm(layer.input_layernorm, hidden)
-        batch = normed.shape[0]
+        batch = hidden.shape[0]
 
-        qkv = self._fast_linear(attn.qkv_weight, normed)
+        qkv = self._fast_linear(
+            attn.qkv_weight, hidden, norm=layer.input_layernorm
+        )
         keys, values = self.k_cache[index], self.v_cache[index]
         head_shape = (batch, self.n_kv_heads, self.kv_groups, self.head_dim)
 
@@ -598,7 +674,7 @@ class Engine:
             flash_decode(
                 query, keys, values, self.valid_len, self.attn_out,
                 self.acc_buf, self.max_buf, self.sum_buf,
-                self.scaling, self.splits, DECODE_BLOCK_N,
+                self.scaling, self.splits, self.block_n,
             )
             attended = self.attn_out
         else:
@@ -610,9 +686,10 @@ class Engine:
         hidden = self._fast_linear(attn.o_proj.weight, attended, residual=residual)
         return self._mlp(
             layer,
-            self._norm(layer.post_attention_layernorm, hidden),
+            hidden,
             fast=True,
             residual=hidden,
+            norm=layer.post_attention_layernorm,
         )
 
     @torch.inference_mode()
@@ -637,7 +714,7 @@ class Engine:
         for index, layer in enumerate(self.layers):
             hidden = self._layer_decode(layer, index, hidden, cos, sin, mask)
         logits = self._fast_linear(
-            self.model.lm_head.weight, self._norm(self.base.norm, hidden)
+            self.model.lm_head.weight, hidden, norm=self.base.norm
         )
 
         self.next_token.copy_(logits[:, -1, :].argmax(dim=-1, keepdim=True))

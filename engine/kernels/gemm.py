@@ -58,11 +58,14 @@ def _skinny_gemm(
     x_ptr,
     w_ptr,
     r_ptr,
+    g_ptr,
     o_ptr,
     M,
     N,
     K,
+    eps,
     HAS_RESIDUAL: tl.constexpr,
+    NORMALIZE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -73,6 +76,24 @@ def _skinny_gemm(
     n_live = offs_n < N
     m_live = offs_m < M
 
+    inv = tl.zeros((BLOCK_M,), tl.float32)
+    if NORMALIZE:
+        # The RMS reduction needs the whole row before any of it can be
+        # scaled, so the input is streamed twice. It is a few kilobytes
+        # against tens of megabytes of weights, and it saves a launch and a
+        # round trip through HBM.
+        squares = tl.zeros((BLOCK_M,), tl.float32)
+        for k0 in range(0, K, BLOCK_K):
+            offs_k = k0 + tl.arange(0, BLOCK_K)
+            k_live = offs_k < K
+            chunk = tl.load(
+                x_ptr + offs_m[:, None] * K + offs_k[None, :],
+                mask=m_live[:, None] & k_live[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            squares += tl.sum(chunk * chunk, axis=1)
+        inv = tl.math.rsqrt(squares / K + eps)
+
     acc = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
     for k0 in range(0, K, BLOCK_K):
         offs_k = k0 + tl.arange(0, BLOCK_K)
@@ -82,6 +103,12 @@ def _skinny_gemm(
             mask=m_live[:, None] & k_live[None, :],
             other=0.0,
         )
+        if NORMALIZE:
+            # Round the normalized value to bf16 before the gain multiply,
+            # which is where Qwen3RMSNorm puts its cast.
+            normed = (x.to(tl.float32) * inv[:, None]).to(tl.bfloat16)
+            gain = tl.load(g_ptr + offs_k, mask=k_live, other=0.0)
+            x = (normed.to(tl.float32) * gain[None, :].to(tl.float32)).to(tl.bfloat16)
         w = tl.load(
             w_ptr + offs_n[:, None] * K + offs_k[None, :],
             mask=n_live[:, None] & k_live[None, :],
@@ -109,18 +136,26 @@ def _skinny_gemm(
     )
 
 
-def run(x, weight, out, config, residual=None) -> None:
+def run(x, weight, out, config, residual=None, gain=None, eps=0.0) -> None:
     """x is [M, K], weight is [N, K], out is [M, N]; all contiguous bf16.
 
     ``residual``, if given, is [M, N] and is added in the epilogue, folding
     what would otherwise be a separate launch per residual branch per layer.
+    ``gain``, if given, is the [K] RMSNorm weight applied to ``x`` before the
+    product, folding the pre-matmul norm in the same way.
     """
     block_n, block_k, warps, stages = config
     rows, k = x.shape
     n = weight.shape[0]
     _skinny_gemm[(triton.cdiv(n, block_n),)](
-        x, weight, residual if residual is not None else x, out, rows, n, k,
+        x,
+        weight,
+        residual if residual is not None else x,
+        gain if gain is not None else x,
+        out,
+        rows, n, k, eps,
         HAS_RESIDUAL=residual is not None,
+        NORMALIZE=gain is not None,
         BLOCK_M=block_m_for(rows), BLOCK_N=block_n, BLOCK_K=block_k,
         num_warps=warps, num_stages=stages,
     )

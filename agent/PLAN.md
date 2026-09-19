@@ -255,4 +255,41 @@ so it is the verification step — no local or rented GPU required.
 | flash decode + fused projections + fallbacks | 5d2189a / f587d356 | 116.1 | 268.2 | 1514.3 | 479.4 | New banked best. TPOT ratios 0.22/0.24/0.24x native. Correctness and latency gates passed. |
 | skinny GEMM + chunked sync | c78533f / 8f04a7b3 | 125.2 | 273.2 | 1558.4 | 495.7 | New banked best. Candidate ms improved to 255.6/468.5/1314.2. |
 | fused RMSNorm + RoPE + SwiGLU | f4b49b6 / 3578a1ff | 188.5 | 383.9 | 2399.7 | 743.5 | New banked best. Candidate ms 169.7/333.4/853.4, TTFT 0.65/0.74/0.73x native. |
+| residual in GEMM epilogue + 12-config autotune | 7b48455 / b3f0f39a | | | | pending | |
+| one kernel for norm+rotary+cache write | 9fb9dbd / — | | | | pending | |
+
+## What the measurements actually said
+
+TPOT on public-0 is the cleanest decode signal: 9.17 -> 7.74 -> 7.55 -> 4.86 ms.
+
+**Host-side stall was never the problem.** Batching the per-step device sync
+eight ways moved TPOT only 7.74 -> 7.55 ms. Had the per-step `.tolist()`
+stall been significant, that change alone would have been large. It was not,
+so the step is real GPU work and there is no point chasing the host further.
+
+**Launch count was the problem.** Removing roughly 1100 launches took 7.55 ->
+4.86 ms, about 2.3 us apiece. That is too much to be launch overhead alone:
+these kernels are small enough that memory latency sets their cost, so fusing
+removes a round trip as well as a launch. This is why fusion kept paying when
+the custom GEMM did not.
+
+**The projections were never as far off peak as they looked.** At 4.86 ms with
+~550 launches left, overhead is ~1.3 ms and the remaining ~3.6 ms streams
+8.05 GB, which is ~2200 GB/s or about two thirds of peak. cuBLAS won most of
+the autotune. The custom GEMM's real value turned out to be the fused
+epilogue, not beating cuBLAS at the matmul.
+
+**Native's own timings move a lot between runs.** Reference TPOT came back at
+20.7, 35.6 and 19.7 ms across three runs of the same reference. The latency
+gates are ratios against that, so they have slack, but no single native
+number should be treated as ground truth.
+
+## Remaining budget
+
+Against the ~2.4 ms bandwidth floor, a realistic best is ~3.5 ms once launches
+are minimal: ~0.9 ms of irreducible overhead plus ~2.6 ms of weight streaming.
+On this scoring that is roughly 1030. Going past it requires more than one
+token per weight read, i.e. speculative decoding with exact verification —
+which is also the one optimization whose cost depends on the prompt, and so
+sits in direct tension with the 25% spread gate we currently clear at 0.3%.
 | residual GEMM epilogue + wider GEMM search + sync-all | pending | pending | pending | pending | pending | Submitting next. Adds residual-add epilogue validation and raises sync chunk to 1024. |
