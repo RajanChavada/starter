@@ -16,6 +16,7 @@ from transformers import AutoModelForCausalLM
 
 from kernels import elementwise, gemm
 from kernels.flash_decode import BLOCK_M, choose_splits, flash_decode
+from kernels.qkv import qkv_finish
 from kernels.rmsnorm import rms_norm
 
 DEVICE = "cuda:0"
@@ -111,6 +112,7 @@ class Engine:
         self._fused_norm = False
         self._fused_rope = False
         self._fused_swiglu = False
+        self._fused_qkv = False
         self._batch = 0
         self._capacity = 0
         self._graph = None
@@ -199,9 +201,49 @@ class Engine:
         self._fused_norm = self._check(self._try_norm)
         self._fused_rope = self._check(lambda: self._try_rope(batch))
         self._fused_swiglu = self._check(lambda: self._try_swiglu(batch))
+        self._fused_qkv = self._check(lambda: self._try_qkv(batch))
         _log(
             f"fusions norm={self._fused_norm} rope={self._fused_rope} "
-            f"swiglu={self._fused_swiglu}"
+            f"swiglu={self._fused_swiglu} qkv={self._fused_qkv}"
+        )
+
+    def _try_qkv(self, batch: int) -> bool:
+        attn = self.layers[0].self_attn
+        capacity = self._capacity
+        position = min(5, capacity - 1)
+        width = self.q_size + 2 * self.kv_size
+        head_shape = (batch, self.n_kv_heads, self.kv_groups, self.head_dim)
+        cache_shape = (batch, self.n_kv_heads, capacity, self.head_dim)
+
+        qkv = torch.randn((batch, width), device=DEVICE, dtype=torch.bfloat16)
+        slot = torch.tensor([position], dtype=torch.int64, device=DEVICE)
+        keys = torch.zeros(cache_shape, dtype=torch.bfloat16, device=DEVICE)
+        values = torch.zeros_like(keys)
+        query = torch.empty(head_shape, dtype=torch.bfloat16, device=DEVICE)
+        qkv_finish(
+            qkv, attn.q_norm.weight, attn.k_norm.weight,
+            self.cos_table, self.sin_table, slot,
+            query, keys, values, attn.q_norm.variance_epsilon,
+        )
+
+        q_end = self.q_size
+        k_end = q_end + self.kv_size
+        cos = self.cos_table[position].view(1, 1, 1, self.head_dim)
+        sin = self.sin_table[position].view(1, 1, 1, self.head_dim)
+        want_q = attn.q_norm(
+            qkv[:, :q_end].reshape(batch, 1, -1, self.head_dim)
+        ).view(head_shape)
+        want_k = attn.k_norm(
+            qkv[:, q_end:k_end].reshape(batch, 1, -1, self.head_dim)
+        ).view(batch, self.n_kv_heads, 1, self.head_dim)
+        want_v = qkv[:, k_end:].reshape(batch, self.n_kv_heads, 1, self.head_dim)
+        want_q = (want_q * cos) + (_rotate_half(want_q) * sin)
+        want_k = (want_k * cos) + (_rotate_half(want_k) * sin)
+
+        return (
+            self._agrees(query, want_q)
+            and self._agrees(keys[:, :, position, :], want_k[:, :, 0, :])
+            and self._agrees(values[:, :, position, :], want_v[:, :, 0, :])
         )
 
     @staticmethod
@@ -512,28 +554,45 @@ class Engine:
         batch = normed.shape[0]
 
         qkv = self._fast_linear(attn.qkv_weight, normed)
-        q_end = self.q_size
-        k_end = q_end + self.kv_size
-        query = self._norm(
-            attn.q_norm, qkv[..., :q_end].reshape(batch, 1, -1, self.head_dim)
-        ).view(batch, self.n_kv_heads, self.kv_groups, self.head_dim)
-        key = self._norm(
-            attn.k_norm, qkv[..., q_end:k_end].reshape(batch, 1, -1, self.head_dim)
-        ).view(batch, self.n_kv_heads, 1, self.head_dim)
-        value = qkv[..., k_end:].reshape(batch, self.n_kv_heads, 1, self.head_dim)
-
-        if self._fused_rope:
-            flat_cos = cos.view(self.head_dim)
-            flat_sin = sin.view(self.head_dim)
-            query = elementwise.rope(query, flat_cos, flat_sin)
-            key = elementwise.rope(key, flat_cos, flat_sin)
-        else:
-            query = (query * cos) + (_rotate_half(query) * sin)
-            key = (key * cos) + (_rotate_half(key) * sin)
-
         keys, values = self.k_cache[index], self.v_cache[index]
-        keys.index_copy_(2, self.cur_pos, key)
-        values.index_copy_(2, self.cur_pos, value)
+        head_shape = (batch, self.n_kv_heads, self.kv_groups, self.head_dim)
+
+        if self._fused_qkv:
+            query = torch.empty(head_shape, dtype=qkv.dtype, device=qkv.device)
+            qkv_finish(
+                qkv.view(batch, -1),
+                attn.q_norm.weight,
+                attn.k_norm.weight,
+                self.cos_table,
+                self.sin_table,
+                self.cur_pos,
+                query,
+                keys,
+                values,
+                attn.q_norm.variance_epsilon,
+            )
+        else:
+            q_end = self.q_size
+            k_end = q_end + self.kv_size
+            query = self._norm(
+                attn.q_norm, qkv[..., :q_end].reshape(batch, 1, -1, self.head_dim)
+            ).view(head_shape)
+            key = self._norm(
+                attn.k_norm, qkv[..., q_end:k_end].reshape(batch, 1, -1, self.head_dim)
+            ).view(batch, self.n_kv_heads, 1, self.head_dim)
+            value = qkv[..., k_end:].reshape(
+                batch, self.n_kv_heads, 1, self.head_dim
+            )
+            if self._fused_rope:
+                flat_cos = cos.view(self.head_dim)
+                flat_sin = sin.view(self.head_dim)
+                query = elementwise.rope(query, flat_cos, flat_sin)
+                key = elementwise.rope(key, flat_cos, flat_sin)
+            else:
+                query = (query * cos) + (_rotate_half(query) * sin)
+                key = (key * cos) + (_rotate_half(key) * sin)
+            keys.index_copy_(2, self.cur_pos, key)
+            values.index_copy_(2, self.cur_pos, value)
 
         if self.use_triton_attn:
             flash_decode(
