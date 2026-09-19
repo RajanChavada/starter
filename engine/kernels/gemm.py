@@ -224,7 +224,96 @@ def _skinny_gemm(
     )
 
 
-def run(x, weight, out, config, residual=None, gain=None, eps=0.0) -> None:
+@triton.jit
+def _swizzled_gemm(
+    x_ptr,
+    w_ptr,
+    r_ptr,
+    g_ptr,
+    o_ptr,
+    M,
+    N,
+    K,
+    eps,
+    HAS_RESIDUAL: tl.constexpr,
+    NORMALIZE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """Same product, but each weight tile is one contiguous run of memory."""
+    pid = tl.program_id(0)
+    offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_m = tl.arange(0, BLOCK_M)
+    m_live = offs_m < M
+    tile_rows = tl.arange(0, BLOCK_N)
+    tile_cols = tl.arange(0, BLOCK_K)
+    blocks = K // BLOCK_K
+
+    inv = tl.zeros((BLOCK_M,), tl.float32)
+    if NORMALIZE:
+        squares = tl.zeros((BLOCK_M,), tl.float32)
+        for step in range(blocks):
+            chunk = tl.load(
+                x_ptr + offs_m[:, None] * K + (step * BLOCK_K + tile_cols)[None, :],
+                mask=m_live[:, None],
+                other=0.0,
+            ).to(tl.float32)
+            squares += tl.sum(chunk * chunk, axis=1)
+        inv = tl.math.rsqrt(squares / K + eps)
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
+    for step in range(blocks):
+        offs_k = step * BLOCK_K + tile_cols
+        x = tl.load(
+            x_ptr + offs_m[:, None] * K + offs_k[None, :],
+            mask=m_live[:, None],
+            other=0.0,
+        )
+        if NORMALIZE:
+            normed = (x.to(tl.float32) * inv[:, None]).to(tl.bfloat16)
+            gain = tl.load(g_ptr + offs_k)
+            x = (normed.to(tl.float32) * gain[None, :].to(tl.float32)).to(tl.bfloat16)
+        # One contiguous BLOCK_N x BLOCK_K block, laid out for this program in
+        # __init__, rather than BLOCK_N runs strided K apart.
+        base = (pid * blocks + step) * (BLOCK_N * BLOCK_K)
+        w = tl.load(w_ptr + base + tile_rows[:, None] * BLOCK_K + tile_cols[None, :])
+        acc += tl.dot(x, tl.trans(w))
+
+    result = acc.to(o_ptr.dtype.element_ty)
+    if HAS_RESIDUAL:
+        residual = tl.load(
+            r_ptr + offs_m[:, None] * N + offs_n[None, :], mask=m_live[:, None], other=0.0
+        )
+        result = (result.to(tl.float32) + residual.to(tl.float32)).to(
+            o_ptr.dtype.element_ty
+        )
+    tl.store(
+        o_ptr + offs_m[:, None] * N + offs_n[None, :], result, mask=m_live[:, None]
+    )
+
+
+def swizzle(weight, config):
+    """Relayout a weight into the tile order its kernel will stream.
+
+    Returns None when the tiling does not divide the weight evenly; padding
+    would mean reading bytes that are not there, and the plain kernel already
+    handles those shapes. Done once at load, which is untimed.
+    """
+    if len(config) != 4:
+        return None
+    block_n, block_k = config[0], config[1]
+    n, k = weight.shape
+    if n % block_n or k % block_k:
+        return None
+    return (
+        weight.view(n // block_n, block_n, k // block_k, block_k)
+        .permute(0, 2, 1, 3)
+        .contiguous()
+    )
+
+
+def run(x, weight, out, config, residual=None, gain=None, eps=0.0, swizzled=None) -> None:
     """x is [M, K], weight is [N, K], out is [M, N]; all contiguous bf16.
 
     ``residual``, if given, is [M, N] and is added in the epilogue, folding
@@ -255,6 +344,21 @@ def run(x, weight, out, config, residual=None, gain=None, eps=0.0) -> None:
         return
 
     block_n, block_k, warps, stages = config
+    if swizzled is not None:
+        _swizzled_gemm[(n // block_n,)](
+            x,
+            swizzled,
+            residual if residual is not None else x,
+            gain if gain is not None else x,
+            out,
+            rows, n, k, eps,
+            HAS_RESIDUAL=residual is not None,
+            NORMALIZE=gain is not None,
+            BLOCK_M=block_m_for(rows), BLOCK_N=block_n, BLOCK_K=block_k,
+            num_warps=warps, num_stages=stages,
+        )
+        return
+
     _skinny_gemm[(triton.cdiv(n, block_n),)](
         x,
         weight,
