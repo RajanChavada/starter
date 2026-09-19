@@ -24,6 +24,9 @@ DEVICE = "cuda:0"
 #: Fold the residual add into the GEMM store, rather than its own launch.
 USE_RESIDUAL_EPILOGUE = False
 
+#: Activate gate/up inside the down projection rather than in its own launch.
+USE_SWIGLU_EPILOGUE = True
+
 #: Decode steps run between device syncs. Each yield must still be one step,
 #: but nothing requires one D2H copy per step, and the copy costs a stall.
 SYNC_CHUNK = 1024
@@ -117,6 +120,7 @@ class Engine:
         self._fused_swiglu = False
         self._fused_qkv = False
         self._gemm_norm = False
+        self._gemm_swiglu = False
         self._batch = 0
         self._capacity = 0
         self._graph = None
@@ -172,6 +176,10 @@ class Engine:
         linear = self._fast_linear if fast else _torch_linear
         if fast:
             gate_up = self._fast_linear(layer.mlp.gateup_weight, hidden, norm=norm)
+            if self._gemm_swiglu:
+                return self._fast_linear(
+                    layer.mlp.down_proj.weight, gate_up, residual=residual, swiglu=True
+                )
         else:
             if norm is not None:
                 hidden = self._norm(norm, hidden)
@@ -212,11 +220,32 @@ class Engine:
         self._fused_swiglu = self._check(lambda: self._try_swiglu(batch))
         self._fused_qkv = self._check(lambda: self._try_qkv(batch))
         self._gemm_norm = self._check(lambda: self._try_gemm_norm(batch))
+        self._gemm_swiglu = USE_SWIGLU_EPILOGUE and self._check(
+            lambda: self._try_gemm_swiglu(batch)
+        )
         _log(
             f"fusions norm={self._fused_norm} rope={self._fused_rope} "
             f"swiglu={self._fused_swiglu} qkv={self._fused_qkv} "
-            f"gemm_norm={self._gemm_norm}"
+            f"gemm_norm={self._gemm_norm} gemm_swiglu={self._gemm_swiglu}"
         )
+
+    def _try_gemm_swiglu(self, batch: int) -> bool:
+        """Check the down projection's fused activation against silu-then-matmul."""
+        weight = self.layers[0].mlp.down_proj.weight
+        config = self._gemm_plan.get(tuple(weight.shape))
+        if config is None:
+            return False
+        gate_up = torch.randn(
+            (batch, 2 * self.mlp_size), device=DEVICE, dtype=torch.bfloat16
+        )
+        want = F.linear(
+            F.silu(gate_up[:, : self.mlp_size]) * gate_up[:, self.mlp_size :],
+            weight,
+        )
+        out = torch.empty((batch, weight.shape[0]), device=DEVICE, dtype=torch.bfloat16)
+        gemm.run(gate_up, weight, out, config, swiglu=True)
+        torch.cuda.synchronize()
+        return self._agrees(out, want)
 
     def _try_gemm_norm(self, batch: int) -> bool:
         """Check the GEMM's fused RMSNorm against norm-then-matmul.
@@ -322,7 +351,7 @@ class Engine:
 
     # ------------------------------------------------------------ projections
 
-    def _fast_linear(self, weight, x, residual=None, norm=None):
+    def _fast_linear(self, weight, x, residual=None, norm=None, swiglu=False):
         """Decode-path matmul, using whichever of cuBLAS or Triton won at warmup.
 
         ``residual`` and ``norm`` are folded into the kernel when the custom
@@ -330,7 +359,7 @@ class Engine:
         to its own launch if the fused form was not adopted at warmup.
         """
         if residual is not None and not USE_RESIDUAL_EPILOGUE:
-            return residual + self._fast_linear(weight, x, norm=norm)
+            return residual + self._fast_linear(weight, x, norm=norm, swiglu=swiglu)
         config = self._gemm_plan.get(tuple(weight.shape))
         fused_norm = norm is not None and config is not None and self._gemm_norm
         if norm is not None and not fused_norm:
@@ -348,6 +377,7 @@ class Engine:
             residual=None if residual is None else residual.reshape(rows, -1),
             gain=norm.weight if fused_norm else None,
             eps=norm.variance_epsilon if fused_norm else 0.0,
+            swiglu=swiglu,
         )
         return out.view(rows, 1, -1)
 
