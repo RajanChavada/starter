@@ -25,6 +25,11 @@ DEVICE = "cuda:0"
 #: but nothing requires one D2H copy per step, and the copy costs a stall.
 SYNC_CHUNK = 1024
 
+#: A challenger must beat the incumbent by this much to be adopted. Without a
+#: margin the autotune flips between near-equal candidates on timing noise,
+#: and an unlucky warmup then slows the whole run.
+SWITCH_MARGIN = 0.97
+
 #: Tolerance for accepting a custom GEMM against cuBLAS. Both accumulate in
 #: fp32 and round once, so a correct kernel lands far inside this.
 GEMM_ATOL = 0.05
@@ -62,19 +67,29 @@ def _torch_linear(weight, x):
     return F.linear(x, weight)
 
 
-def _time_ms(call, iterations: int = 25) -> float:
-    """Median-ish device time for a launch, used only during warmup."""
-    for _ in range(5):
+def _time_ms(call, iterations: int = 60, sweeps: int = 3) -> float:
+    """Best observed device time for a launch, used only during warmup.
+
+    Taking the minimum across several sweeps rather than one average matters
+    more than it looks. These launches are tens of microseconds, so a single
+    average is easily skewed by whatever else the device is doing, and the
+    autotune then locks in a worse config for the entire run. The minimum is
+    the closest thing to the launch's own cost, and it is stable.
+    """
+    for _ in range(10):
         call()
     torch.cuda.synchronize()
+    best = float("inf")
     start = torch.cuda.Event(enable_timing=True)
     stop = torch.cuda.Event(enable_timing=True)
-    start.record()
-    for _ in range(iterations):
-        call()
-    stop.record()
-    torch.cuda.synchronize()
-    return start.elapsed_time(stop) / iterations
+    for _ in range(sweeps):
+        start.record()
+        for _ in range(iterations):
+            call()
+        stop.record()
+        torch.cuda.synchronize()
+        best = min(best, start.elapsed_time(stop) / iterations)
+    return best
 
 
 class Engine:
@@ -394,7 +409,7 @@ class Engine:
                 elapsed = _time_ms(lambda: gemm.run(x, weight, out, config))
             except Exception:  # noqa: BLE001 - a bad config is just not chosen
                 continue
-            if elapsed < best_ms:
+            if elapsed < best_ms * SWITCH_MARGIN:
                 best, best_ms = config, elapsed
 
         if best is not None and not self._residual_agrees(best, x, weight, out):
@@ -541,7 +556,7 @@ class Engine:
                     )
                 except Exception:  # noqa: BLE001
                     continue
-                if elapsed < best_ms:
+                if elapsed < best_ms * SWITCH_MARGIN:
                     best, best_ms = (splits, block_n), elapsed
 
         if best is not None:
