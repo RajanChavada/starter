@@ -285,6 +285,29 @@ so it is the verification step — no local or rented GPU required.
 | 1444d26 | restore of 4f7c38f tree | pending | | |
 | 59425ba | replay-timed warmup autotune | pending | | queued |
 
+| 1444d26 | restore of 4f7c38f tree | **failed** | 4.66 | `unstable_timing` |
+
+## The platform itself is unstable right now, and it matters
+
+Run 6d2dd51e ran the byte-identical best tree and **failed the 25% spread
+gate**. Its public-0 step was 4.66 ms, right at our best, but public-1 and
+public-2 came back with TTFT of 319 ms and 317 ms against roughly 148 ms and
+136 ms on every earlier run of the same code. Prefill did not change; the
+machine did. An earlier run of the same tree was also cancelled with
+`harness_error`.
+
+This reframes the recent history. Identical code has now produced 4.47, 4.51,
+4.66 and 5.55 ms on public-0, and a run that failed outright. Some of the
+"regressions" reverted after 4f7c38f were probably partly this, which means
+single-run attribution is unreliable at the moment and a change needs to be
+worth well over 20% before one measurement can distinguish it from the
+infrastructure.
+
+Practical consequence: prefer re-measuring the same tree to get a second
+sample before believing any result, and treat `unstable_timing` and
+`harness_error` on a known-good tree as platform faults to retry rather than
+signals to change code.
+
 Everything attempted after 4f7c38f has been a regression. The cheap
 launch-collapsing wins are spent, and the three structural attempts since
 (autotune margin, further epilogue fusion, weight relayout) all made the step
