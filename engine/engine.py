@@ -44,6 +44,22 @@ USE_CUDA_GRAPH = True
 #: any lazy allocation happens outside the graph.
 CAPTURE_WARMUP_STEPS = 3
 
+#: Repeats inside a timing graph. The candidates being compared take tens of
+#: microseconds, which is the same order as a Triton launch from Python, so
+#: timing them one Python call at a time measures the host, not the device.
+#: Inside a graph the launches are issued by the GPU, exactly as they will be
+#: in the captured decode step, and the per-replay cost amortises away.
+TIME_REPEATS = 8
+
+#: Replays per candidate. The minimum is kept: interference only ever adds.
+TIME_REPLAYS = 5
+
+#: A write this large evicts an H100's 50 MB L2. Without it a repeat would
+#: read the weights the previous repeat just pulled in, and several of these
+#: projections are small enough to sit in L2 entirely -- which they never do
+#: in a real step, where 8 GB streams past between two visits to one weight.
+L2_SCRATCH_BYTES = 64 << 20
+
 
 def _log(message: str) -> None:
     """Diagnostics for the run log's bounded tail.
@@ -119,6 +135,9 @@ class Engine:
         self._graph = None
         self._graph_shape = None
         self._warmed = False
+        self._flush = None
+        self._flush_ms = 0.0
+        self._graph_timing = False
         self.k_cache = []
         self.v_cache = []
         _log(
@@ -346,6 +365,112 @@ class Engine:
         )
         return out.view(rows, 1, -1)
 
+    # ------------------------------------------------------------ warmup timer
+
+    def _start_timing(self) -> None:
+        """Set up the warmup timer, preferring device time inside a graph.
+
+        The candidates this has to rank are 6 to 30 us of pure HBM streaming.
+        A Triton launch from Python costs enough on its own to swamp the
+        smaller ones, so an eager loop over 25 calls measures how fast the
+        host can enqueue and ranks every configuration the same. Measuring a
+        captured replay instead moves dispatch onto the device, which is also
+        where it happens once the decode step is captured.
+
+        The probe doubles as the cost of the L2 flush that separates the
+        repeats, which every later measurement subtracts.
+        """
+        self._flush = None
+        self._flush_ms = 0.0
+        self._graph_timing = False
+        try:
+            self._flush = torch.empty(
+                L2_SCRATCH_BYTES // 4, dtype=torch.int32, device=DEVICE
+            )
+            probe = self._graph_ms(lambda: None)
+        except Exception as error:  # noqa: BLE001 - the eager timer still works
+            _log(f"graph timing unavailable: {type(error).__name__}: {error}")
+            probe = None
+        if probe is None:
+            self._flush = None
+            _log("warmup timing: eager")
+            return
+        self._flush_ms = probe
+        self._graph_timing = True
+        _log(f"warmup timing: graph, flush={probe * 1000:.0f}us")
+
+    def _stop_timing(self) -> None:
+        self._flush = None
+        self._graph_timing = False
+        torch.cuda.empty_cache()
+
+    def _graph_ms(self, call):
+        """Time one ``call`` as a captured replay, or None if capture fails."""
+        try:
+            return self._replay_ms(call)
+        except Exception:  # noqa: BLE001 - caller falls back or skips
+            return None
+        finally:
+            # The graph died with the frame above; this releases its pool
+            # before the next candidate captures one of its own.
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+
+    @torch.no_grad()
+    def _replay_ms(self, call) -> float:
+        for _ in range(2):
+            self._flush.zero_()
+            call()
+        torch.cuda.synchronize()
+
+        # Capture wants its warmup on a side stream, the same way the decode
+        # capture does it.
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(2):
+                self._flush.zero_()
+                call()
+        torch.cuda.current_stream().wait_stream(stream)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            for _ in range(TIME_REPEATS):
+                self._flush.zero_()
+                call()
+
+        start = torch.cuda.Event(enable_timing=True)
+        stop = torch.cuda.Event(enable_timing=True)
+        graph.replay()
+        torch.cuda.synchronize()
+        best = float("inf")
+        for _ in range(TIME_REPLAYS):
+            start.record()
+            graph.replay()
+            stop.record()
+            torch.cuda.synchronize()
+            best = min(best, start.elapsed_time(stop) / TIME_REPEATS)
+        return best
+
+    def _measure(self, call):
+        """Graph-timed device milliseconds for ``call``, or None.
+
+        The flush is subtracted so the logged numbers mean something, but it
+        is the same constant for every candidate of a shape, so it cannot
+        change which one wins -- including when a very cheap kernel lands
+        under it and the difference comes out negative.
+        """
+        elapsed = self._graph_ms(call)
+        return None if elapsed is None else elapsed - self._flush_ms
+
+    def _timer(self):
+        """The timer to rank one shape's candidates with.
+
+        Chosen per shape rather than per candidate: mixing graph and eager
+        numbers inside one comparison would rank the timers, not the kernels.
+        """
+        return self._measure if self._graph_timing else _time_ms
+
     def _plan_gemms(self, batch: int) -> None:
         """Benchmark every projection shape, cuBLAS against each Triton config.
 
@@ -372,7 +497,11 @@ class Engine:
             x = torch.randn((batch, columns), device=DEVICE, dtype=torch.bfloat16)
             out = torch.empty((batch, rows), device=DEVICE, dtype=torch.bfloat16)
             reference = F.linear(x, weight)
-            baseline = _time_ms(lambda: F.linear(x, weight))
+            timer = self._timer()
+            baseline = timer(lambda: F.linear(x, weight))
+            if baseline is None:
+                timer = _time_ms
+                baseline = timer(lambda: F.linear(x, weight))
             allowed = GEMM_ATOL + GEMM_RTOL * reference.float().abs().max().item()
         except Exception as error:  # noqa: BLE001
             _log(f"gemm plan skipped [{rows}x{columns}]: {type(error).__name__}")
@@ -391,8 +520,10 @@ class Engine:
                 gap = (out.float() - reference.float()).abs().max().item()
                 if not gap <= allowed:
                     continue
-                elapsed = _time_ms(lambda: gemm.run(x, weight, out, config))
+                elapsed = timer(lambda: gemm.run(x, weight, out, config))
             except Exception:  # noqa: BLE001 - a bad config is just not chosen
+                continue
+            if elapsed is None:
                 continue
             if elapsed < best_ms:
                 best, best_ms = config, elapsed
@@ -465,6 +596,7 @@ class Engine:
             (capacity, batch), dtype=torch.int64, device=DEVICE
         )
 
+        self._start_timing()
         self._plan_gemms(batch)
         self._plan_fusions(batch)
 
@@ -474,6 +606,7 @@ class Engine:
             device=DEVICE,
         )
         self._plan_attention()
+        self._stop_timing()
 
         self._graph = None
         self._graph_shape = None
@@ -510,11 +643,17 @@ class Engine:
             values = torch.randn(cache_shape, generator=generator, device=DEVICE, dtype=torch.bfloat16)
             probe = torch.empty_like(query)
             mask = (self.slots < capacity).view(1, 1, 1, capacity)
-            baseline = _time_ms(
-                lambda: F.scaled_dot_product_attention(
+            timer = self._timer()
+
+            def sdpa():
+                return F.scaled_dot_product_attention(
                     query, keys, values, attn_mask=mask, scale=self.scaling
                 )
-            )
+
+            baseline = timer(sdpa)
+            if baseline is None:
+                timer = _time_ms
+                baseline = timer(sdpa)
         except Exception as error:  # noqa: BLE001
             _log(f"attention plan skipped: {type(error).__name__}: {error}")
             return
@@ -533,13 +672,15 @@ class Engine:
                         query, keys, values, probe, buffers, splits, block_n
                     ):
                         continue
-                    elapsed = _time_ms(
+                    elapsed = timer(
                         lambda: flash_decode(
                             query, keys, values, self._full_len, probe,
                             *buffers, self.scaling, splits, block_n,
                         )
                     )
                 except Exception:  # noqa: BLE001
+                    continue
+                if elapsed is None:
                     continue
                 if elapsed < best_ms:
                     best, best_ms = (splits, block_n), elapsed
