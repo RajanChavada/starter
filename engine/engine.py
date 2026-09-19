@@ -69,19 +69,27 @@ def _torch_linear(weight, x):
     return F.linear(x, weight)
 
 
-def _time_ms(call, iterations: int = 25) -> float:
-    """Median-ish device time for a launch, used only during warmup."""
+def _time_ms(call, iterations: int = 25, bursts: int = 3) -> float:
+    """Device time for a launch, used only during warmup.
+
+    The fastest of several bursts: a clock ramp or a neighbour's interference
+    inflates one burst, and a single inflated reading would pin a slower
+    configuration for the whole run.
+    """
     for _ in range(5):
         call()
     torch.cuda.synchronize()
-    start = torch.cuda.Event(enable_timing=True)
-    stop = torch.cuda.Event(enable_timing=True)
-    start.record()
-    for _ in range(iterations):
-        call()
-    stop.record()
-    torch.cuda.synchronize()
-    return start.elapsed_time(stop) / iterations
+    best = float("inf")
+    for _ in range(bursts):
+        start = torch.cuda.Event(enable_timing=True)
+        stop = torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(iterations):
+            call()
+        stop.record()
+        torch.cuda.synchronize()
+        best = min(best, start.elapsed_time(stop) / iterations)
+    return best
 
 
 class Engine:
