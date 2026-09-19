@@ -267,7 +267,7 @@ so it is the verification step — no local or rented GPU required.
 | revert to 3c5eb28 tree, byte identical | c9a7ac6 | | | | 766.3 | **p0 tpot 5.55 vs 4.47 for the same code** |
 | split-K for narrow projections | 4f7c38f | 204.4 | 412.6 | 2483.6 | **799.7** | p0 tpot 4.51. Best. |
 | reproducible autotune | 84c5d62 | | | | pending | |
-| replay-timed warmup autotune | 59425ba | | | | pending | queued |
+| replay-timed warmup autotune | 59425ba | 193.5 | 400.6 | 2207.9 | 742.2 | regression |
 | aligned / evict-first GEMM loads | 8d22ca8 | | | | pending | queued |
 | eight-step decode graph replay | pending | | | | pending | submitting next |
 
@@ -284,7 +284,7 @@ so it is the verification step — no local or rented GPU required.
 | d8bee03 | swiglu epilogue + single-split + deep-K | 595.5 | 6.59 | reverted |
 | 005bc30 | pre-swizzled weight layout | 727.5 | 5.79 | reverted |
 | 1444d26 | restore of 4f7c38f tree | pending | | |
-| 59425ba | replay-timed warmup autotune | pending | | queued |
+| 59425ba | replay-timed warmup autotune | 742.2 | | reverted/regression |
 | 8d22ca8 | aligned / evict-first GEMM loads | pending | | queued |
 
 | 1444d26 | restore of 4f7c38f tree | **failed** | 4.66 | `unstable_timing` |
