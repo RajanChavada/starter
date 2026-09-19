@@ -14,8 +14,9 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM
 
-from kernels import gemm
+from kernels import elementwise, gemm
 from kernels.flash_decode import BLOCK_M, choose_splits, flash_decode
+from kernels.rmsnorm import rms_norm
 
 DEVICE = "cuda:0"
 
@@ -107,6 +108,9 @@ class Engine:
         self._fuse_projections()
 
         self._gemm_plan = {}
+        self._fused_norm = False
+        self._fused_rope = False
+        self._fused_swiglu = False
         self._batch = 0
         self._capacity = 0
         self._graph = None
@@ -161,9 +165,74 @@ class Engine:
     def _mlp(self, layer, hidden, fast: bool = False):
         linear = self._fast_linear if fast else _torch_linear
         gate_up = linear(layer.mlp.gateup_weight, hidden)
-        gate = gate_up[..., : self.mlp_size]
-        up = gate_up[..., self.mlp_size :]
-        return linear(layer.mlp.down_proj.weight, F.silu(gate) * up)
+        if self._fused_swiglu:
+            activated = elementwise.swiglu(gate_up)
+        else:
+            activated = (
+                F.silu(gate_up[..., : self.mlp_size]) * gate_up[..., self.mlp_size :]
+            )
+        return linear(layer.mlp.down_proj.weight, activated)
+
+    # ---------------------------------------------------------------- fusions
+
+    def _norm(self, module, x):
+        if self._fused_norm:
+            return rms_norm(x, module.weight, module.variance_epsilon)
+        return module(x)
+
+    @staticmethod
+    def _agrees(got, want) -> bool:
+        gap = (got.float() - want.float()).abs().max().item()
+        return gap <= CHECK_ATOL + CHECK_RTOL * want.float().abs().max().item()
+
+    def _plan_fusions(self, batch: int) -> None:
+        """Adopt each fused kernel only if it reproduces the module it replaces.
+
+        Every fusion is checked separately, so one bad kernel costs its own
+        launches rather than the whole set.
+        """
+        self._fused_norm = self._check(self._try_norm)
+        self._fused_rope = self._check(lambda: self._try_rope(batch))
+        self._fused_swiglu = self._check(lambda: self._try_swiglu(batch))
+        _log(
+            f"fusions norm={self._fused_norm} rope={self._fused_rope} "
+            f"swiglu={self._fused_swiglu}"
+        )
+
+    @staticmethod
+    def _check(attempt) -> bool:
+        try:
+            return bool(attempt())
+        except Exception as error:  # noqa: BLE001 - unusable kernel, not a failure
+            _log(f"fusion unusable: {type(error).__name__}: {error}")
+            return False
+
+    def _try_norm(self) -> bool:
+        # Both widths the model norms over: the hidden state and one head.
+        for module in (self.layers[0].input_layernorm, self.layers[0].self_attn.q_norm):
+            width = module.weight.shape[0]
+            x = torch.randn((16, width), device=DEVICE, dtype=torch.bfloat16)
+            if not self._agrees(
+                rms_norm(x, module.weight, module.variance_epsilon), module(x)
+            ):
+                return False
+        return True
+
+    def _try_rope(self, batch: int) -> bool:
+        shape = (batch, self.n_kv_heads, self.kv_groups, self.head_dim)
+        x = torch.randn(shape, device=DEVICE, dtype=torch.bfloat16)
+        cos = self.cos_table[3]
+        sin = self.sin_table[3]
+        wide = cos.view(1, 1, 1, self.head_dim)
+        want = (x * wide) + (_rotate_half(x) * sin.view(1, 1, 1, self.head_dim))
+        return self._agrees(elementwise.rope(x, cos, sin), want)
+
+    def _try_swiglu(self, batch: int) -> bool:
+        x = torch.randn(
+            (batch, 1, 2 * self.mlp_size), device=DEVICE, dtype=torch.bfloat16
+        )
+        want = F.silu(x[..., : self.mlp_size]) * x[..., self.mlp_size :]
+        return self._agrees(elementwise.swiglu(x), want)
 
     # ------------------------------------------------------------ projections
 
@@ -274,6 +343,7 @@ class Engine:
         )
 
         self._plan_gemms(batch)
+        self._plan_fusions(batch)
 
         heads = batch * self.n_kv_heads
         self.splits = choose_splits(heads, capacity, DECODE_BLOCK_N)
@@ -349,7 +419,7 @@ class Engine:
     def _layer_prefill(self, layer, index, hidden, cos, sin):
         attn = layer.self_attn
         residual = hidden
-        normed = layer.input_layernorm(hidden)
+        normed = self._norm(layer.input_layernorm, hidden)
         batch, length, _ = normed.shape
         head_shape = (batch, length, -1, self.head_dim)
 
@@ -358,8 +428,8 @@ class Engine:
         qkv = F.linear(normed, attn.qkv_weight)
         q_end = self.q_size
         k_end = q_end + self.kv_size
-        query = attn.q_norm(qkv[..., :q_end].reshape(head_shape)).transpose(1, 2)
-        key = attn.k_norm(qkv[..., q_end:k_end].reshape(head_shape)).transpose(1, 2)
+        query = self._norm(attn.q_norm, qkv[..., :q_end].reshape(head_shape)).transpose(1, 2)
+        key = self._norm(attn.k_norm, qkv[..., q_end:k_end].reshape(head_shape)).transpose(1, 2)
         value = qkv[..., k_end:].reshape(head_shape).transpose(1, 2)
         query = (query * cos) + (_rotate_half(query) * sin)
         key = (key * cos) + (_rotate_half(key) * sin)
@@ -373,7 +443,9 @@ class Engine:
         )
         attended = attended.transpose(1, 2).reshape(batch, length, -1)
         hidden = residual + attn.o_proj(attended)
-        return hidden + self._mlp(layer, layer.post_attention_layernorm(hidden))
+        return hidden + self._mlp(
+            layer, self._norm(layer.post_attention_layernorm, hidden)
+        )
 
     @torch.inference_mode()
     def _prefill(self, ids: torch.Tensor) -> torch.Tensor:
@@ -383,7 +455,7 @@ class Engine:
         sin = self.sin_table[:length].view(1, 1, length, self.head_dim)
         for index, layer in enumerate(self.layers):
             hidden = self._layer_prefill(layer, index, hidden, cos, sin)
-        return self.model.lm_head(self.base.norm(hidden[:, -1:, :]))
+        return self.model.lm_head(self._norm(self.base.norm, hidden[:, -1:, :]))
 
     # --------------------------------------------------------------- decode
 
@@ -403,22 +475,28 @@ class Engine:
         """
         attn = layer.self_attn
         residual = hidden
-        normed = layer.input_layernorm(hidden)
+        normed = self._norm(layer.input_layernorm, hidden)
         batch = normed.shape[0]
 
         qkv = self._fast_linear(attn.qkv_weight, normed)
         q_end = self.q_size
         k_end = q_end + self.kv_size
-        query = attn.q_norm(
-            qkv[..., :q_end].reshape(batch, 1, -1, self.head_dim)
+        query = self._norm(
+            attn.q_norm, qkv[..., :q_end].reshape(batch, 1, -1, self.head_dim)
         ).view(batch, self.n_kv_heads, self.kv_groups, self.head_dim)
-        key = attn.k_norm(
-            qkv[..., q_end:k_end].reshape(batch, 1, -1, self.head_dim)
+        key = self._norm(
+            attn.k_norm, qkv[..., q_end:k_end].reshape(batch, 1, -1, self.head_dim)
         ).view(batch, self.n_kv_heads, 1, self.head_dim)
         value = qkv[..., k_end:].reshape(batch, self.n_kv_heads, 1, self.head_dim)
 
-        query = (query * cos) + (_rotate_half(query) * sin)
-        key = (key * cos) + (_rotate_half(key) * sin)
+        if self._fused_rope:
+            flat_cos = cos.view(self.head_dim)
+            flat_sin = sin.view(self.head_dim)
+            query = elementwise.rope(query, flat_cos, flat_sin)
+            key = elementwise.rope(key, flat_cos, flat_sin)
+        else:
+            query = (query * cos) + (_rotate_half(query) * sin)
+            key = (key * cos) + (_rotate_half(key) * sin)
 
         keys, values = self.k_cache[index], self.v_cache[index]
         keys.index_copy_(2, self.cur_pos, key)
@@ -439,7 +517,7 @@ class Engine:
         attended = attended.reshape(batch, 1, -1)
         hidden = residual + self._fast_linear(attn.o_proj.weight, attended)
         return hidden + self._mlp(
-            layer, layer.post_attention_layernorm(hidden), fast=True
+            layer, self._norm(layer.post_attention_layernorm, hidden), fast=True
         )
 
     @torch.inference_mode()
@@ -463,7 +541,9 @@ class Engine:
 
         for index, layer in enumerate(self.layers):
             hidden = self._layer_decode(layer, index, hidden, cos, sin, mask)
-        logits = self._fast_linear(self.model.lm_head.weight, self.base.norm(hidden))
+        logits = self._fast_linear(
+            self.model.lm_head.weight, self._norm(self.base.norm, hidden)
+        )
 
         self.next_token.copy_(logits[:, -1, :].argmax(dim=-1, keepdim=True))
         self.step_token.copy_(self.next_token)
