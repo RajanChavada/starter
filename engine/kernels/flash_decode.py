@@ -39,6 +39,7 @@ def _split_attention(
     CAP: tl.constexpr,
     G: tl.constexpr,
     D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     SPLITS: tl.constexpr,
 ):
@@ -115,6 +116,7 @@ def _combine_splits(
     out_ptr,
     G: tl.constexpr,
     D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
     SPLITS: tl.constexpr,
 ):
     head = tl.program_id(0)
@@ -180,11 +182,12 @@ def flash_decode(query, keys, values, length, out, acc_buf, max_buf, sum_buf,
 
     _split_attention[(programs, splits)](
         query, keys, values, length, acc_buf, max_buf, sum_buf, scale,
-        CAP=capacity, G=groups, D=head_dim, BLOCK_N=block_n, SPLITS=splits,
+        CAP=capacity, G=groups, D=head_dim,
+        BLOCK_M=BLOCK_M, BLOCK_N=block_n, SPLITS=splits,
         num_warps=4, num_stages=2,
     )
     _combine_splits[(programs,)](
         acc_buf, max_buf, sum_buf, out,
-        G=groups, D=head_dim, SPLITS=splits,
+        G=groups, D=head_dim, BLOCK_M=BLOCK_M, SPLITS=splits,
         num_warps=4, num_stages=2,
     )

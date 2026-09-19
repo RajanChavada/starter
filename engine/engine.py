@@ -102,7 +102,9 @@ class Engine:
         still the same dot product over the same inputs; only the tiling
         cuBLAS chooses differs, which is a reordering.
 
-        Originals are dropped so the fused copies do not double weight memory.
+        The originals stay resident. Removing them from the module tree is the
+        riskiest part of this change and buys only memory we are not short of;
+        nothing reads them, so they cost capacity, not bandwidth.
         """
         attn = self.layers[0].self_attn
         self.q_size = attn.q_proj.weight.shape[0]
@@ -114,13 +116,10 @@ class Engine:
             attn.qkv_weight = torch.cat(
                 [attn.q_proj.weight, attn.k_proj.weight, attn.v_proj.weight], dim=0
             )
-            del attn.q_proj, attn.k_proj, attn.v_proj
-
             mlp = layer.mlp
             mlp.gateup_weight = torch.cat(
                 [mlp.gate_proj.weight, mlp.up_proj.weight], dim=0
             )
-            del mlp.gate_proj, mlp.up_proj
 
         torch.cuda.empty_cache()
         _log(
@@ -205,9 +204,18 @@ class Engine:
     def _validate_attention(self) -> bool:
         """Check the custom kernel against SDPA before trusting it.
 
-        Warmup is untimed, so this is free. A kernel that disagrees costs us
-        speed by falling back; one that silently disagreed would cost the run.
+        Warmup is untimed, so this is free. Any disagreement, and any
+        exception at all — a Triton compile failure, a bad launch grid, an
+        unsupported construct in this Triton build — falls back to the SDPA
+        path. A broken kernel then costs throughput instead of the run.
         """
+        try:
+            return self._compare_attention()
+        except Exception as error:  # noqa: BLE001 - fall back on anything
+            _log(f"kernel unusable, falling back to sdpa: {type(error).__name__}: {error}")
+            return False
+
+    def _compare_attention(self) -> bool:
         batch, capacity = self._batch, self._capacity
         generator = torch.Generator(device=DEVICE).manual_seed(0)
         shape = (batch, self.n_kv_heads, self.kv_groups, self.head_dim)
@@ -415,7 +423,16 @@ class Engine:
 
         use_graph = USE_CUDA_GRAPH and max_new_tokens > 1
         if use_graph and self._graph_shape != (batch, capacity):
-            self._capture()
+            try:
+                self._capture()
+            except Exception as error:  # noqa: BLE001 - eager still produces tokens
+                _log(f"capture failed, decoding eagerly: {type(error).__name__}: {error}")
+                self._graph = None
+                self._graph_shape = None
+                for keys, values in zip(self.k_cache, self.v_cache):
+                    keys.zero_()
+                    values.zero_()
+        use_graph = use_graph and self._graph is not None
         self._warmed = True
 
         with torch.inference_mode():
