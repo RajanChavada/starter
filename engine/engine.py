@@ -15,6 +15,7 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM
 
 from kernels import elementwise, gemm
+from kernels import flash_decode as flash_decode_module
 from kernels.flash_decode import BLOCK_M, choose_splits, flash_decode
 from kernels.qkv import qkv_finish
 from kernels.rmsnorm import rms_norm
@@ -578,6 +579,8 @@ class Engine:
             _log(f"attention plan skipped: {type(error).__name__}: {error}")
             return
 
+        self._verify_attention_fixup(query, keys, values, probe)
+
         best, best_ms = None, baseline
         seen = set()
         for block_n in (32, 64, 128):
@@ -611,6 +614,48 @@ class Engine:
             f"attention sdpa={baseline * 1000:.0f}us chosen="
             f"{'triton ' + str(best) if best else 'sdpa'} at {best_ms * 1000:.0f}us"
         )
+
+    def _verify_attention_fixup(self, query, keys, values, probe) -> None:
+        """Replay the single-launch attention against the two-launch form.
+
+        Same discipline as the split-K fixup: many trials across the valid
+        lengths and split counts the run can see, bit-identical or disabled.
+        """
+        if not flash_decode_module.FIXUP:
+            return
+        capacity = self._capacity
+        heads = self._batch * self.n_kv_heads
+        try:
+            plain = torch.empty_like(probe)
+            lengths = sorted({1, min(BLOCK_M + 1, capacity), max(1, capacity // 2), capacity})
+            for trial in range(48):
+                block_n = (32, 64, 128)[trial % 3]
+                ceiling = choose_splits(heads, capacity, block_n)
+                splits = max(1, ceiling >> ((trial // 3) % 3))
+                buffers = self._attention_buffers(splits)
+                length = torch.tensor(
+                    [lengths[trial % len(lengths)]], dtype=torch.int64, device=DEVICE
+                )
+                flash_decode_module.FIXUP = True
+                flash_decode(
+                    query, keys, values, length, probe, *buffers,
+                    self.scaling, splits, block_n,
+                )
+                flash_decode_module.FIXUP = False
+                flash_decode(
+                    query, keys, values, length, plain, *buffers,
+                    self.scaling, splits, block_n,
+                )
+                flash_decode_module.FIXUP = True
+                torch.cuda.synchronize()
+                if not torch.equal(probe, plain):
+                    raise RuntimeError(
+                        f"mismatch on trial {trial} splits={splits} block_n={block_n}"
+                    )
+            _log("attention fixup verified bit-identical to the two-launch combine")
+        except Exception as error:  # noqa: BLE001 - keep the proven path
+            flash_decode_module.FIXUP = False
+            _log(f"attention fixup disabled: {type(error).__name__}: {error}")
 
     def _attention_agrees(self, query, keys, values, probe, buffers, splits, block_n) -> bool:
         capacity = self._capacity
