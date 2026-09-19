@@ -60,7 +60,6 @@ def _skinny_gemm(
     eps,
     HAS_RESIDUAL: tl.constexpr,
     NORMALIZE: tl.constexpr,
-    SWIGLU: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -93,29 +92,11 @@ def _skinny_gemm(
     for k0 in range(0, K, BLOCK_K):
         offs_k = k0 + tl.arange(0, BLOCK_K)
         k_live = offs_k < K
-        if SWIGLU:
-            # Read the gate/up projection directly and activate in place,
-            # instead of materialising silu(gate)*up in its own launch.
-            row = offs_m[:, None] * (2 * K)
-            gate = tl.load(
-                x_ptr + row + offs_k[None, :],
-                mask=m_live[:, None] & k_live[None, :],
-                other=0.0,
-            ).to(tl.float32)
-            up = tl.load(
-                x_ptr + row + K + offs_k[None, :],
-                mask=m_live[:, None] & k_live[None, :],
-                other=0.0,
-            ).to(tl.float32)
-            # torch rounds silu's result before the multiply.
-            activated = (gate * tl.sigmoid(gate)).to(tl.bfloat16).to(tl.float32)
-            x = (activated * up).to(tl.bfloat16)
-        else:
-            x = tl.load(
-                x_ptr + offs_m[:, None] * K + offs_k[None, :],
-                mask=m_live[:, None] & k_live[None, :],
-                other=0.0,
-            )
+        x = tl.load(
+            x_ptr + offs_m[:, None] * K + offs_k[None, :],
+            mask=m_live[:, None] & k_live[None, :],
+            other=0.0,
+        )
         if NORMALIZE:
             # Round the normalized value to bf16 before the gain multiply,
             # which is where Qwen3RMSNorm puts its cast.
@@ -149,7 +130,7 @@ def _skinny_gemm(
     )
 
 
-def run(x, weight, out, config, residual=None, gain=None, eps=0.0, swiglu=False) -> None:
+def run(x, weight, out, config, residual=None, gain=None, eps=0.0) -> None:
     """x is [M, K], weight is [N, K], out is [M, N]; all contiguous bf16.
 
     ``residual``, if given, is [M, N] and is added in the epilogue, folding
@@ -158,8 +139,7 @@ def run(x, weight, out, config, residual=None, gain=None, eps=0.0, swiglu=False)
     product, folding the pre-matmul norm in the same way.
     """
     block_n, block_k, warps, stages = config
-    rows = x.shape[0]
-    k = weight.shape[1]
+    rows, k = x.shape
     n = weight.shape[0]
     _skinny_gemm[(triton.cdiv(n, block_n),)](
         x,
@@ -170,7 +150,6 @@ def run(x, weight, out, config, residual=None, gain=None, eps=0.0, swiglu=False)
         rows, n, k, eps,
         HAS_RESIDUAL=residual is not None,
         NORMALIZE=gain is not None,
-        SWIGLU=swiglu,
         BLOCK_M=block_m_for(rows), BLOCK_N=block_n, BLOCK_K=block_k,
         num_warps=warps, num_stages=stages,
     )

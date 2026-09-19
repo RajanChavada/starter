@@ -255,6 +255,20 @@ so it is the verification step — no local or rented GPU required.
 | flash decode + fused projections + fallbacks | 5d2189a / f587d356 | 116.1 | 268.2 | 1514.3 | 479.4 | New banked best. TPOT ratios 0.22/0.24/0.24x native. Correctness and latency gates passed. |
 | skinny GEMM + chunked sync | c78533f / 8f04a7b3 | 125.2 | 273.2 | 1558.4 | 495.7 | New banked best. Candidate ms improved to 255.6/468.5/1314.2. |
 | fused RMSNorm + RoPE + SwiGLU | f4b49b6 / 3578a1ff | 188.5 | 383.9 | 2399.7 | 743.5 | New banked best. Candidate ms 169.7/333.4/853.4, TTFT 0.65/0.74/0.73x native. |
+| residual epilogue + 12-config autotune | 7b48455 | | | | 719.1 | Regression. Later split: the 12 configs were the loss, the epilogue a win. |
+| one kernel for norm+rotary+cache write | 9fb9dbd | | | | 780.8 | +8.5% while still carrying the 12-config loss. |
+| attention autotune + RMSNorm into GEMM | 7c2a739 | | | | 772.5 | Within noise. |
+| autotune narrowed back to 6 configs | 3c5eb28 | | | | **796.5** | Best. Confirms the widening was the regression. |
+| residual epilogue disabled | 9db3ed8 | | | | 762.3 | -4%, TPOT 4.47 -> 5.55. Epilogue earns its place; restored. |
+| SwiGLU epilogue + sync chunk 16 | 23496cb | | | | 747.0 | Every public TPOT improved yet score fell. See noise note. |
+| speculative decoding | 47335e6 | | | | pending | |
+| verification through the fused path | 5db42b5 | | | | pending | |
+| residual epilogue restored | 629e156 | | | | pending | |
+
+**Score noise is roughly +/-2-3%.** 23496cb improved all three public TPOTs
+versus its parent and still scored 2% lower, so anything under about 5% on the
+private geomean is not signal. Only changes that move TPOT visibly, or the
+score by more than ~5%, have been trusted.
 | residual in GEMM epilogue + 12-config autotune | 7b48455 / b3f0f39a | 190.6 | 377.3 | 2246.8 | 719.1 | Lost to f4b49b6 despite public-0 gain. Candidate ms 167.9/339.3/911.5; engine reverted. |
 | one kernel for norm+rotary+cache write | 9fb9dbd / db4bf30d | 201.8 | 402.7 | 2464.6 | 780.8 | New banked best. Candidate ms 158.6/317.9/831.0. |
 

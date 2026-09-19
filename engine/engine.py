@@ -21,23 +21,6 @@ from kernels.rmsnorm import rms_norm
 
 DEVICE = "cuda:0"
 
-#: Fold the residual add into the GEMM store, rather than its own launch.
-USE_RESIDUAL_EPILOGUE = True
-
-#: Activate gate/up inside the down projection rather than in its own launch.
-USE_SWIGLU_EPILOGUE = True
-
-#: Draft tokens proposed per verification step. Each step costs one forward,
-#: and a forward is bound by streaming the weights, so verifying k+1 positions
-#: costs almost exactly what verifying one does. That is the entire idea: the
-#: same 8 GB read can yield up to k+1 tokens.
-DRAFT_LEN = 4
-
-#: Context length matched when looking a draft up in the text so far.
-LOOKUP_NGRAM = 2
-
-USE_SPECULATION = True
-
 #: Decode steps run between device syncs. Each yield must still be one step,
 #: but nothing requires one D2H copy per step, and the copy costs a stall.
 SYNC_CHUNK = 1024
@@ -131,9 +114,6 @@ class Engine:
         self._fused_swiglu = False
         self._fused_qkv = False
         self._gemm_norm = False
-        self._gemm_swiglu = False
-        self._speculate = False
-        self._verify_graph = None
         self._batch = 0
         self._capacity = 0
         self._graph = None
@@ -189,10 +169,6 @@ class Engine:
         linear = self._fast_linear if fast else _torch_linear
         if fast:
             gate_up = self._fast_linear(layer.mlp.gateup_weight, hidden, norm=norm)
-            if self._gemm_swiglu:
-                return self._fast_linear(
-                    layer.mlp.down_proj.weight, gate_up, residual=residual, swiglu=True
-                )
         else:
             if norm is not None:
                 hidden = self._norm(norm, hidden)
@@ -233,32 +209,11 @@ class Engine:
         self._fused_swiglu = self._check(lambda: self._try_swiglu(batch))
         self._fused_qkv = self._check(lambda: self._try_qkv(batch))
         self._gemm_norm = self._check(lambda: self._try_gemm_norm(batch))
-        self._gemm_swiglu = USE_SWIGLU_EPILOGUE and self._check(
-            lambda: self._try_gemm_swiglu(batch)
-        )
         _log(
             f"fusions norm={self._fused_norm} rope={self._fused_rope} "
             f"swiglu={self._fused_swiglu} qkv={self._fused_qkv} "
-            f"gemm_norm={self._gemm_norm} gemm_swiglu={self._gemm_swiglu}"
+            f"gemm_norm={self._gemm_norm}"
         )
-
-    def _try_gemm_swiglu(self, batch: int) -> bool:
-        """Check the down projection's fused activation against silu-then-matmul."""
-        weight = self.layers[0].mlp.down_proj.weight
-        config = self._gemm_plan.get(tuple(weight.shape))
-        if config is None:
-            return False
-        gate_up = torch.randn(
-            (batch, 2 * self.mlp_size), device=DEVICE, dtype=torch.bfloat16
-        )
-        want = F.linear(
-            F.silu(gate_up[:, : self.mlp_size]) * gate_up[:, self.mlp_size :],
-            weight,
-        )
-        out = torch.empty((batch, weight.shape[0]), device=DEVICE, dtype=torch.bfloat16)
-        gemm.run(gate_up, weight, out, config, swiglu=True)
-        torch.cuda.synchronize()
-        return self._agrees(out, want)
 
     def _try_gemm_norm(self, batch: int) -> bool:
         """Check the GEMM's fused RMSNorm against norm-then-matmul.
@@ -364,15 +319,13 @@ class Engine:
 
     # ------------------------------------------------------------ projections
 
-    def _fast_linear(self, weight, x, residual=None, norm=None, swiglu=False):
+    def _fast_linear(self, weight, x, residual=None, norm=None):
         """Decode-path matmul, using whichever of cuBLAS or Triton won at warmup.
 
         ``residual`` and ``norm`` are folded into the kernel when the custom
         path is active, removing one launch each per layer. Either falls back
         to its own launch if the fused form was not adopted at warmup.
         """
-        if residual is not None and not USE_RESIDUAL_EPILOGUE:
-            return residual + self._fast_linear(weight, x, norm=norm, swiglu=swiglu)
         config = self._gemm_plan.get(tuple(weight.shape))
         fused_norm = norm is not None and config is not None and self._gemm_norm
         if norm is not None and not fused_norm:
@@ -380,23 +333,18 @@ class Engine:
         if config is None:
             out = F.linear(x, weight)
             return out if residual is None else residual + out
-        # Flatten every leading dimension: decode passes [B, 1, K] and
-        # verification passes [B, T, K], and both are just rows to the kernel.
-        flat = x.reshape(-1, x.shape[-1])
-        out = torch.empty(
-            (flat.shape[0], weight.shape[0]), dtype=x.dtype, device=x.device
-        )
+        rows = x.shape[0]
+        out = torch.empty((rows, weight.shape[0]), dtype=x.dtype, device=x.device)
         gemm.run(
-            flat,
+            x.reshape(rows, -1),
             weight,
             out,
             config,
-            residual=None if residual is None else residual.reshape(-1, residual.shape[-1]),
+            residual=None if residual is None else residual.reshape(rows, -1),
             gain=norm.weight if fused_norm else None,
             eps=norm.variance_epsilon if fused_norm else 0.0,
-            swiglu=swiglu,
         )
-        return out.view(*x.shape[:-1], -1)
+        return out.view(rows, 1, -1)
 
     def _plan_gemms(self, batch: int) -> None:
         """Benchmark every projection shape, cuBLAS against each Triton config.
@@ -511,15 +459,6 @@ class Engine:
         self.token_log = torch.zeros(
             (capacity, batch), dtype=torch.int64, device=DEVICE
         )
-
-        self.draft_range = torch.arange(
-            DRAFT_LEN + 1, device=DEVICE, dtype=torch.int64
-        )
-        self.verify_ids = torch.zeros(
-            (batch, DRAFT_LEN + 1), dtype=torch.int64, device=DEVICE
-        )
-        self.verify_pred = torch.zeros_like(self.verify_ids)
-        self._verify_graph = None
 
         self._plan_gemms(batch)
         self._plan_fusions(batch)
@@ -819,229 +758,6 @@ class Engine:
             f"peak={torch.cuda.max_memory_allocated() / 2**30:.2f}GiB"
         )
 
-    # ---------------------------------------------------------- speculation
-
-    def _layer_verify(self, layer, index, hidden, cos, sin, mask, slots):
-        """One layer over DRAFT_LEN+1 positions at once.
-
-        Query heads fold into the query-length dimension as [B, 8, T*G, D],
-        the same trick the single-token path uses, so this stays plain
-        multi-head attention and never asks SDPA to expand the cache 8 -> 32.
-        Row t*G+g is token t of query group g, which is what the mask's
-        causality is expressed against.
-        """
-        attn = layer.self_attn
-        residual = hidden
-        batch, length, _ = hidden.shape
-        head_shape = (batch, length, -1, self.head_dim)
-
-        qkv = self._fast_linear(
-            attn.qkv_weight, hidden, norm=layer.input_layernorm
-        )
-        q_end = self.q_size
-        k_end = q_end + self.kv_size
-        query = self._norm(attn.q_norm, qkv[..., :q_end].reshape(head_shape))
-        key = self._norm(
-            attn.k_norm, qkv[..., q_end:k_end].reshape(head_shape)
-        ).transpose(1, 2)
-        value = qkv[..., k_end:].reshape(head_shape).transpose(1, 2)
-
-        wide_cos = cos.view(1, length, 1, self.head_dim)
-        wide_sin = sin.view(1, length, 1, self.head_dim)
-        query = (query * wide_cos) + (_rotate_half(query) * wide_sin)
-        key = (key * cos.view(1, 1, length, self.head_dim)) + (
-            _rotate_half(key) * sin.view(1, 1, length, self.head_dim)
-        )
-
-        keys, values = self.k_cache[index], self.v_cache[index]
-        keys.index_copy_(2, slots, key)
-        values.index_copy_(2, slots, value)
-
-        # [B, T, Nq, D] -> [B, Nkv, T*G, D]
-        folded = query.view(
-            batch, length, self.n_kv_heads, self.kv_groups, self.head_dim
-        ).permute(0, 2, 1, 3, 4).reshape(
-            batch, self.n_kv_heads, length * self.kv_groups, self.head_dim
-        )
-        attended = F.scaled_dot_product_attention(
-            folded, keys, values, attn_mask=mask, scale=self.scaling
-        )
-        attended = attended.view(
-            batch, self.n_kv_heads, length, self.kv_groups, self.head_dim
-        ).permute(0, 2, 1, 3, 4).reshape(batch, length, -1)
-
-        hidden = self._fast_linear(attn.o_proj.weight, attended, residual=residual)
-        return self._mlp(
-            layer,
-            hidden,
-            fast=True,
-            residual=hidden,
-            norm=layer.post_attention_layernorm,
-        )
-
-    @torch.inference_mode()
-    def _verify_step(self) -> None:
-        """Score DRAFT_LEN+1 positions from a fixed buffer, entirely on device."""
-        length = DRAFT_LEN + 1
-        slots = self.cur_pos + self.draft_range
-        hidden = self.base.embed_tokens(self.verify_ids)
-        cos = self.cos_table.index_select(0, slots)
-        sin = self.sin_table.index_select(0, slots)
-        # Key j is visible to row r only once it exists and is at or before
-        # that row's own position. attention_mask=None cannot express this.
-        mask = (
-            self.slots.view(1, 1, 1, self._capacity)
-            <= slots.repeat_interleave(self.kv_groups).view(1, 1, -1, 1)
-        )
-
-        for index, layer in enumerate(self.layers):
-            hidden = self._layer_verify(layer, index, hidden, cos, sin, mask, slots)
-        logits = self._fast_linear(
-            self.model.lm_head.weight, hidden, norm=self.base.norm
-        )
-        self.verify_pred.copy_(logits.argmax(dim=-1))
-
-    def _draft(self, history, table) -> list[int]:
-        """Propose continuations by finding where this context last occurred.
-
-        Costs nothing at generation time because the index is built as tokens
-        arrive, and needs no draft model, so nothing can drift from the
-        target distribution: wrong guesses are simply rejected.
-        """
-        if len(history) <= LOOKUP_NGRAM:
-            return []
-        key = tuple(history[-LOOKUP_NGRAM:])
-        at = table.get(key)
-        if at is None:
-            return []
-        return history[at + 1 : at + 1 + DRAFT_LEN]
-
-    @staticmethod
-    def _index(history, table, start: int) -> None:
-        for position in range(max(start, LOOKUP_NGRAM - 1), len(history)):
-            table[tuple(history[position - LOOKUP_NGRAM + 1 : position + 1])] = position
-
-    def _try_speculation(self) -> bool:
-        """Verify that perfect drafts reproduce plain decode exactly.
-
-        This is the property the whole scheme rests on: scoring DRAFT_LEN+1
-        positions in one forward must give the same argmax at each position
-        that DRAFT_LEN+1 separate single-token steps would. If it does, then
-        accepting only the prefix the model agreed with is exact by
-        construction. If it does not, speculation is switched off.
-        """
-        probe = DRAFT_LEN + 1
-        seed = 1000
-        for keys, values in zip(self.k_cache, self.v_cache):
-            keys.zero_()
-            values.zero_()
-        self.cur_pos.zero_()
-        self.step_idx.zero_()
-        self.step_token.fill_(seed)
-        plain = []
-        for _ in range(probe):
-            self._decode_step()
-            plain.append(self.next_token[:, 0].tolist())
-
-        for keys, values in zip(self.k_cache, self.v_cache):
-            keys.zero_()
-            values.zero_()
-        self.cur_pos.zero_()
-        self.step_idx.zero_()
-        rows = [
-            [seed] + [plain[step][row] for step in range(DRAFT_LEN)]
-            for row in range(self._batch)
-        ]
-        self.verify_ids.copy_(torch.tensor(rows, dtype=torch.int64, device=DEVICE))
-        self._verify_step()
-        want = [
-            [plain[step][row] for step in range(probe)] for row in range(self._batch)
-        ]
-        return self.verify_pred.tolist() == want
-
-    def _capture_verify(self) -> None:
-        stream = torch.cuda.Stream()
-        stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(stream):
-            for _ in range(CAPTURE_WARMUP_STEPS):
-                self.cur_pos.zero_()
-                self._verify_step()
-        torch.cuda.current_stream().wait_stream(stream)
-        self.cur_pos.zero_()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            self._verify_step()
-        self._verify_graph = graph
-        for keys, values in zip(self.k_cache, self.v_cache):
-            keys.zero_()
-            values.zero_()
-
-    def _accepted(self, proposals, predicted) -> int:
-        """Longest prefix of the drafts the model actually agrees with.
-
-        Taken as the minimum over the batch so one shared cache position stays
-        valid for every sequence. Position zero is always accepted: it is the
-        genuine greedy continuation of a prefix the model just scored, which
-        is what makes this exact rather than approximate.
-        """
-        accepted = DRAFT_LEN + 1
-        for row, drafts in enumerate(proposals):
-            count = 1
-            while count <= len(drafts) and drafts[count - 1] == predicted[row][count - 1]:
-                count += 1
-            accepted = min(accepted, count)
-        return accepted
-
-    def _generate_speculative(self, input_ids, first_row, max_new_tokens):
-        """Decode by proposing, scoring and accepting a prefix per forward.
-
-        The caller has already emitted the first token. From here each pass
-        scores the current token plus DRAFT_LEN guesses and keeps however many
-        the model confirms, so the number of weight streams is the number of
-        passes rather than the number of tokens.
-        """
-        batch = len(input_ids)
-        history = [list(row) for row in input_ids]
-        # Last position of every bigram, built in one pass so a long prompt
-        # does not show up as latency. Later duplicates win, which is what we
-        # want: the most recent occurrence is the best predictor.
-        tables = [
-            dict(zip(zip(row, row[1:]), range(1, len(row)))) for row in history
-        ]
-        for row, token in zip(history, first_row):
-            row.append(token)
-        for row, table in zip(history, tables):
-            self._index(row, table, len(row) - 1)
-
-        current = list(first_row)
-        delivered = 1
-        while delivered < max_new_tokens:
-            proposals = [self._draft(row, table) for row, table in zip(history, tables)]
-            padded = [
-                [current[row]] + proposals[row] + [0] * (DRAFT_LEN - len(proposals[row]))
-                for row in range(batch)
-            ]
-            self.verify_ids.copy_(
-                torch.tensor(padded, dtype=torch.int64, device=DEVICE)
-            )
-            self._verify_graph.replay()
-            predicted = self.verify_pred.tolist()
-
-            take = min(
-                self._accepted(proposals, predicted), max_new_tokens - delivered
-            )
-            for step in range(take):
-                row = [predicted[seq][step] for seq in range(batch)]
-                for seq in range(batch):
-                    history[seq].append(row[seq])
-                yield row
-            for seq in range(batch):
-                self._index(history[seq], tables[seq], len(history[seq]) - take)
-
-            current = [predicted[seq][take - 1] for seq in range(batch)]
-            self.cur_pos.add_(take)
-            delivered += take
-
     # ------------------------------------------------------------ interface
 
     def generate(self, input_ids: list[list[int]], max_new_tokens: int):
@@ -1052,7 +768,7 @@ class Engine:
         """
         batch = len(input_ids)
         prompt_length = len(input_ids[0])
-        capacity = prompt_length + max_new_tokens + DRAFT_LEN
+        capacity = prompt_length + max_new_tokens
 
         if not self._warmed:
             _log(
@@ -1064,14 +780,6 @@ class Engine:
             if self._warmed:
                 _log(f"reshape mid-run to batch={batch} capacity={capacity}")
             self._allocate(batch, capacity)
-
-        if USE_SPECULATION and not self._warmed and max_new_tokens > DRAFT_LEN:
-            self._speculate = self._check(self._try_speculation)
-            if self._speculate:
-                self._speculate = self._check(
-                    lambda: self._capture_verify() or True
-                )
-            _log(f"speculation {'on' if self._speculate else 'off'}")
 
         use_graph = USE_CUDA_GRAPH and max_new_tokens > 1
         if use_graph and self._graph_shape != (batch, capacity):
@@ -1098,12 +806,6 @@ class Engine:
             self.step_idx.fill_(1)
             # First token goes out immediately; time to first token is a gate.
             yield first[:, 0].tolist()
-
-            if self._speculate and self._verify_graph is not None:
-                yield from self._generate_speculative(
-                    input_ids, first[:, 0].tolist(), max_new_tokens
-                )
-                return
 
             delivered = 1
             while delivered < max_new_tokens:
