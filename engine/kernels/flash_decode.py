@@ -242,7 +242,7 @@ def _split_attention_fixup(
 
 
 #: Set False to fall back to the separate combine launch.
-FIXUP = True
+FIXUP = False
 
 _locks = {}
 

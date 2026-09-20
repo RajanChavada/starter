@@ -207,7 +207,7 @@ def _split_gemm_fixup(
 
 
 #: Set False to fall back to the separate reduction launch.
-SPLIT_FIXUP = True
+SPLIT_FIXUP = False
 
 _locks = {}
 
