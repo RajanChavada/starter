@@ -106,6 +106,130 @@ def _qkv_finish(
         tl.store(dst + hi, tl.load(src + hi))
 
 
+@triton.jit
+def _norm_rope_rows(
+    src, src_stride, row_mask, gain, cos_ptr, sin_ptr, pos, eps,
+    BLOCK_T: tl.constexpr, HALF: tl.constexpr, D: tl.constexpr,
+):
+    """``_norm_rope`` over a block of rows, each with its own position."""
+    rows = tl.arange(0, BLOCK_T)
+    lo = tl.arange(0, HALF)
+    hi = HALF + lo
+    ptr = src + rows[:, None] * src_stride
+    mask = row_mask[:, None] & (lo[None, :] < HALF)
+
+    x_lo = tl.load(ptr + lo[None, :], mask=mask, other=0.0).to(tl.float32)
+    x_hi = tl.load(ptr + hi[None, :], mask=mask, other=0.0).to(tl.float32)
+    variance = (tl.sum(x_lo * x_lo, 1) + tl.sum(x_hi * x_hi, 1)) / D
+    inv = tl.math.rsqrt(variance + eps)
+
+    n_lo = (x_lo * inv[:, None]).to(tl.bfloat16)
+    n_hi = (x_hi * inv[:, None]).to(tl.bfloat16)
+    g_lo = tl.load(gain + lo).to(tl.float32)
+    g_hi = tl.load(gain + hi).to(tl.float32)
+    q_lo = (n_lo.to(tl.float32) * g_lo[None, :]).to(tl.bfloat16).to(tl.float32)
+    q_hi = (n_hi.to(tl.float32) * g_hi[None, :]).to(tl.bfloat16).to(tl.float32)
+
+    table = pos[:, None] * D
+    cos_lo = tl.load(cos_ptr + table + lo[None, :], mask=mask, other=0.0).to(tl.float32)
+    cos_hi = tl.load(cos_ptr + table + hi[None, :], mask=mask, other=0.0).to(tl.float32)
+    sin_lo = tl.load(sin_ptr + table + lo[None, :], mask=mask, other=0.0).to(tl.float32)
+    sin_hi = tl.load(sin_ptr + table + hi[None, :], mask=mask, other=0.0).to(tl.float32)
+
+    a_lo = (q_lo * cos_lo).to(tl.bfloat16).to(tl.float32)
+    b_lo = (-q_hi * sin_lo).to(tl.bfloat16).to(tl.float32)
+    a_hi = (q_hi * cos_hi).to(tl.bfloat16).to(tl.float32)
+    b_hi = (q_lo * sin_hi).to(tl.bfloat16).to(tl.float32)
+    return (a_lo + b_lo).to(tl.bfloat16), (a_hi + b_hi).to(tl.bfloat16)
+
+
+@triton.jit
+def _qkv_prefill(
+    qkv_ptr,
+    q_gain_ptr,
+    k_gain_ptr,
+    cos_ptr,
+    sin_ptr,
+    q_out_ptr,
+    k_cache_ptr,
+    v_cache_ptr,
+    T,
+    eps,
+    WIDTH: tl.constexpr,
+    N_Q: tl.constexpr,
+    N_KV: tl.constexpr,
+    D: tl.constexpr,
+    HALF: tl.constexpr,
+    CAP: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+):
+    block = tl.program_id(0)
+    slot = tl.program_id(1)
+    lo = tl.arange(0, HALF)
+    hi = HALF + lo
+    # Rows are the [B*T] token rows of the projection; a block never
+    # straddles a sequence because T is a multiple of BLOCK_T or one block.
+    first = block * BLOCK_T
+    rows = first + tl.arange(0, BLOCK_T)
+    seq = rows // T
+    pos = rows - seq * T
+    live = pos < T
+    src = qkv_ptr + rows[:, None] * WIDTH
+    mask = live[:, None] & (lo[None, :] < HALF)
+
+    if slot < N_Q:
+        out_lo, out_hi = _norm_rope_rows(
+            qkv_ptr + first * WIDTH + slot * D, WIDTH, live, q_gain_ptr,
+            cos_ptr, sin_ptr, pos, eps, BLOCK_T, HALF, D,
+        )
+        dst = q_out_ptr + seq[:, None] * (N_Q * T * D) + slot * (T * D) + pos[:, None] * D
+        tl.store(dst + lo[None, :], out_lo, mask=mask)
+        tl.store(dst + hi[None, :], out_hi, mask=mask)
+    elif slot < N_Q + N_KV:
+        head = slot - N_Q
+        out_lo, out_hi = _norm_rope_rows(
+            qkv_ptr + first * WIDTH + (N_Q + head) * D, WIDTH, live, k_gain_ptr,
+            cos_ptr, sin_ptr, pos, eps, BLOCK_T, HALF, D,
+        )
+        dst = (
+            k_cache_ptr + seq[:, None] * (N_KV * CAP * D) + head * (CAP * D)
+            + pos[:, None] * D
+        )
+        tl.store(dst + lo[None, :], out_lo, mask=mask)
+        tl.store(dst + hi[None, :], out_hi, mask=mask)
+    else:
+        head = slot - N_Q - N_KV
+        col = (N_Q + N_KV + head) * D
+        dst = (
+            v_cache_ptr + seq[:, None] * (N_KV * CAP * D) + head * (CAP * D)
+            + pos[:, None] * D
+        )
+        tl.store(dst + lo[None, :], tl.load(src + col + lo[None, :], mask=mask), mask=mask)
+        tl.store(dst + hi[None, :], tl.load(src + col + hi[None, :], mask=mask), mask=mask)
+
+
+def qkv_prefill(qkv, q_gain, k_gain, cos_table, sin_table, q_out, k_cache, v_cache, eps) -> None:
+    """Normalize, rotate and cache a whole prompt's projections.
+
+    ``qkv`` is [B*T, N_Q*D + 2*N_KV*D] contiguous; ``q_out`` is [B, N_Q, T, D],
+    the head-major layout attention reads. K and V land in slots 0..T-1 of the
+    caches. Token t uses row t of the rotary tables.
+    """
+    batch, n_kv, capacity, head_dim = k_cache.shape
+    length = q_out.shape[2]
+    n_q = q_out.shape[1]
+    block_t = 8
+    while block_t > 1 and length % block_t:
+        block_t //= 2
+    _qkv_prefill[(batch * (length // block_t), n_q + 2 * n_kv)](
+        qkv, q_gain, k_gain, cos_table, sin_table,
+        q_out, k_cache, v_cache, length, eps,
+        WIDTH=qkv.shape[-1], N_Q=n_q, N_KV=n_kv, D=head_dim,
+        HALF=head_dim // 2, CAP=capacity, BLOCK_T=block_t,
+        num_warps=4, num_stages=2,
+    )
+
+
 def qkv_finish(
     qkv, q_gain, k_gain, cos_table, sin_table, position, q_out, k_cache, v_cache, eps
 ) -> None:
