@@ -17,7 +17,7 @@ from transformers import AutoModelForCausalLM
 from kernels import elementwise, gemm
 from kernels import flash_decode as flash_decode_module
 from kernels.flash_decode import BLOCK_M, choose_splits, flash_decode
-from kernels.qkv import qkv_finish, qkv_prefill
+from kernels.qkv import qkv_finish
 from kernels.rmsnorm import rms_norm
 
 DEVICE = "cuda:0"
@@ -130,8 +130,6 @@ class Engine:
         self._fused_qkv = False
         self._gemm_norm = False
         self._gemm_activate = False
-        self._fused_prefill_qkv = False
-        self._prefill_check_shape = None
         self._batch = 0
         self._capacity = 0
         self._graph = None
@@ -237,53 +235,6 @@ class Engine:
             f"swiglu={self._fused_swiglu} qkv={self._fused_qkv} "
             f"gemm_norm={self._gemm_norm} gemm_activate={self._gemm_activate}"
         )
-
-    def _try_prefill_qkv(self, batch: int, length: int) -> bool:
-        """The prompt-wide norm/rotary/cache kernel must match the module chain.
-
-        Same rounding points as ``qkv_finish``, applied per token, so the
-        comparison is for equality against the eager prefill path.
-        """
-        attn = self.layers[0].self_attn
-        n_heads = self.n_kv_heads * self.kv_groups
-        cache_shape = (batch, self.n_kv_heads, self._capacity, self.head_dim)
-        head_shape = (batch, length, -1, self.head_dim)
-        cos = self.cos_table[:length].view(1, 1, length, self.head_dim)
-        sin = self.sin_table[:length].view(1, 1, length, self.head_dim)
-        q_end = self.q_size
-        k_end = q_end + self.kv_size
-        for _ in range(3):
-            qkv = torch.randn(
-                (batch, length, q_end + 2 * self.kv_size),
-                device=DEVICE, dtype=torch.bfloat16,
-            ) * 4
-            query = torch.empty(
-                (batch, n_heads, length, self.head_dim), device=DEVICE, dtype=torch.bfloat16
-            )
-            keys = torch.zeros(cache_shape, device=DEVICE, dtype=torch.bfloat16)
-            values = torch.zeros(cache_shape, device=DEVICE, dtype=torch.bfloat16)
-            qkv_prefill(
-                qkv.view(batch * length, -1), attn.q_norm.weight, attn.k_norm.weight,
-                self.cos_table, self.sin_table, query, keys, values,
-                attn.q_norm.variance_epsilon,
-            )
-            want_q = self._norm(attn.q_norm, qkv[..., :q_end].reshape(head_shape)).transpose(1, 2)
-            want_k = self._norm(attn.k_norm, qkv[..., q_end:k_end].reshape(head_shape)).transpose(1, 2)
-            want_v = qkv[..., k_end:].reshape(head_shape).transpose(1, 2)
-            want_q = (want_q * cos) + (_rotate_half(want_q) * sin)
-            want_k = (want_k * cos) + (_rotate_half(want_k) * sin)
-            torch.cuda.synchronize()
-            if not (
-                torch.equal(query, want_q)
-                and torch.equal(keys[:, :, :length], want_k)
-                and torch.equal(values[:, :, :length], want_v)
-                and not keys[:, :, length:].any()
-                and not values[:, :, length:].any()
-            ):
-                gap = (query.float() - want_q.float()).abs().max().item()
-                _log(f"prefill qkv kernel disagrees with the module chain: q gap {gap}")
-                return False
-        return True
 
     def _try_gemm_activate(self, batch: int) -> bool:
         """The SwiGLU-on-load down projection must match SwiGLU then GEMM.
@@ -786,35 +737,16 @@ class Engine:
         # Slicing the fused output splits a stride-1 trailing dimension, so
         # these reshapes are views and cost nothing.
         qkv = F.linear(normed, attn.qkv_weight)
-        if self._fused_prefill_qkv:
-            query = torch.empty(
-                (batch, self.n_kv_heads * self.kv_groups, length, self.head_dim),
-                dtype=qkv.dtype, device=qkv.device,
-            )
-            qkv_prefill(
-                qkv.view(batch * length, -1),
-                attn.q_norm.weight,
-                attn.k_norm.weight,
-                self.cos_table,
-                self.sin_table,
-                query,
-                self.k_cache[index],
-                self.v_cache[index],
-                attn.q_norm.variance_epsilon,
-            )
-            key = self.k_cache[index][:, :, :length, :]
-            value = self.v_cache[index][:, :, :length, :]
-        else:
-            q_end = self.q_size
-            k_end = q_end + self.kv_size
-            query = self._norm(attn.q_norm, qkv[..., :q_end].reshape(head_shape)).transpose(1, 2)
-            key = self._norm(attn.k_norm, qkv[..., q_end:k_end].reshape(head_shape)).transpose(1, 2)
-            value = qkv[..., k_end:].reshape(head_shape).transpose(1, 2)
-            query = (query * cos) + (_rotate_half(query) * sin)
-            key = (key * cos) + (_rotate_half(key) * sin)
+        q_end = self.q_size
+        k_end = q_end + self.kv_size
+        query = self._norm(attn.q_norm, qkv[..., :q_end].reshape(head_shape)).transpose(1, 2)
+        key = self._norm(attn.k_norm, qkv[..., q_end:k_end].reshape(head_shape)).transpose(1, 2)
+        value = qkv[..., k_end:].reshape(head_shape).transpose(1, 2)
+        query = (query * cos) + (_rotate_half(query) * sin)
+        key = (key * cos) + (_rotate_half(key) * sin)
 
-            self.k_cache[index][:, :, :length, :] = key
-            self.v_cache[index][:, :, :length, :] = value
+        self.k_cache[index][:, :, :length, :] = key
+        self.v_cache[index][:, :, :length, :] = value
 
         # No mask plus is_causal keeps this on flash, which supports GQA.
         attended = F.scaled_dot_product_attention(
@@ -1047,12 +979,6 @@ class Engine:
                     keys.zero_()
                     values.zero_()
         use_graph = use_graph and self._graph is not None
-        if self._prefill_check_shape != (batch, prompt_length):
-            self._fused_prefill_qkv = self._check(
-                lambda: self._try_prefill_qkv(batch, prompt_length)
-            )
-            self._prefill_check_shape = (batch, prompt_length)
-            _log(f"prefill qkv fusion={self._fused_prefill_qkv}")
         if USE_CUDA_GRAPH and self._prefill_shape != (batch, prompt_length):
             try:
                 self._capture_prefill(batch, prompt_length)
